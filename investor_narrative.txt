@@ -1,0 +1,116 @@
+
+# FINANCIAL MODEL ANALYSIS - EXECUTIVE SUMMARY
+================================================================================
+
+## 1. BUSINESS MODEL DYNAMICS
+----------------------------------------
+
+**Acquisition Funnel:**
+- Social views convert to website visits at 3.00%
+  (e.g., 100 social views → 3 site visits)
+
+- Website visitors → Signups: 5.00%
+- Signups → Paying users: 18.00%
+- **Overall visitor-to-paid conversion: 0.90%**
+
+**Influencer Marketing Strategy:**
+- Average influencer has 50,000 followers
+- Each collaboration generates ~300 website visitors
+- Influencers contribute 21.1% (Y1) → 7.1% (Y3) of total visitors
+
+
+## 2. GROWTH TRAJECTORY (3-YEAR OUTLOOK)
+----------------------------------------
+
+**Year 1:**
+- Paying users: 254
+- MRR: €7,625
+- ARR: €91,501
+- New customers acquired: 306
+- Marketing spend: €11,952
+
+**Year 2:**
+- Paying users: 1,256
+- MRR: €37,679
+- ARR: €452,148
+- New customers acquired: 1,442
+- Marketing spend: €53,347
+
+**Year 3:**
+- Paying users: 2,842
+- MRR: €85,269
+- ARR: €1,023,229
+- New customers acquired: 2,749
+- Marketing spend: €105,821
+
+
+## 3. CASH FLOW & CAPITAL REQUIREMENTS
+----------------------------------------
+
+- **Minimum cash position: €-18,424** (capital requirement)
+- **Break-even achieved: Month 18**
+- **Cumulative cash at end of Year 3: €612,650**
+
+- Broker target capital: €2,000,000
+  ⚠ **Target not met** (shortfall: €1,387,350)
+
+
+## 4. UNIT ECONOMICS & SUSTAINABILITY
+----------------------------------------
+
+- **ARPU (Average Revenue Per User): €30.00** per month
+
+**CAC and LTV Evolution:**
+- Year 1: CAC = €39, LTV = €400, **LTV/CAC = 10.26x**
+- Year 2: CAC = €37, LTV = €436, **LTV/CAC = 11.79x**
+- Year 3: CAC = €39, LTV = €480, **LTV/CAC = 12.47x**
+
+**Unit Economics Assessment:**
+✓ **HEALTHY** - LTV/CAC ratio of 12.5x indicates sustainable growth
+  Industry benchmark: 3x or higher is considered healthy
+
+
+## 5. RETENTION DYNAMICS
+----------------------------------------
+
+**Monthly Churn Rates:**
+- Year 1: 6.00% (early adopters, higher churn)
+- Year 2: 5.50% (improved product-market fit)
+- Year 3: 5.00% (mature customer base)
+
+- Year 3 monthly retention: 95.00%
+- Implied annual retention: 54.04%
+
+
+## 6. KEY ASSUMPTIONS & SENSITIVITIES
+----------------------------------------
+
+**Critical Success Factors:**
+1. Social media conversion rate maintaining at assumed levels
+2. Influencer collaborations delivering expected reach and engagement
+3. Churn rates improving as product matures
+4. Marketing efficiency (CAC) staying within projected bounds
+
+**Recommended Sensitivity Analysis:**
+- Test scenarios with ±20% variation in conversion rates
+- Model impact of ±10% variation in churn rates
+- Assess effect of ±25% variation in CAC
+- Evaluate influencer collaboration volume changes
+
+
+## 7. INVESTMENT SUMMARY
+----------------------------------------
+
+**By end of Year 3, under these assumptions:**
+- The business reaches **€85,269 MRR** (€1,023,229 ARR)
+- Serving **2,842 paying customers**
+- Cumulative cash position: **€612,650**
+- Initial capital requirement: ~€18,424
+- Additional capital may be needed to reach €2,000,000 target
+
+================================================================================
+
+*This analysis is based on the assumptions in the financial model.*
+*Actual results may vary based on market conditions and execution.*
+
+================================================================================
