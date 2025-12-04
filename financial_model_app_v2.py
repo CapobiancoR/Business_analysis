@@ -49,8 +49,17 @@ def load_from_excel_v7(excel_path: str) -> dict:
     Returns dict with 'assumptions', 'monthly', 'yearly' DataFrames.
     
     v7 Structure:
-    - Assumptions: rows 3-45 (0-indexed: 2-44), columns A-E
+    - Assumptions: rows 3-50 (0-indexed: 2-49), columns A-E (esteso per nuovi parametri)
       Format: Category | Parameter | Value | Unit | Notes
+      
+      NEW (v7.2): TAM/SAM/SOM Market Parameters
+      -----------------------------------------
+      - Market_Max_Followers_Local: tetto follower mercato nicchia (Zurigo/Svizzera) [default: 50,000]
+      - Market_Max_Followers_Global: tetto follower mercato globale [default: 1,000,000]
+      - Market_Max_PayingUsers_Local: tetto paying users nicchia [default: 2,000]
+      - Market_Max_PayingUsers_Global: tetto paying users globale [default: 25,000]
+      - Follower_Adoption_Ramp_Months: mesi per raggiungere crescita max [default: 24]
+      
     - Monthly: row 55=header (0-indexed: 54), rows 56-91=data (0-indexed: 55-90)
     - Yearly: row 94=header (0-indexed: 93), rows 95-97=data (0-indexed: 94-96)
     """
@@ -61,9 +70,9 @@ def load_from_excel_v7(excel_path: str) -> dict:
     
     # ===== PARSE ASSUMPTIONS =====
     # Row 3 is header (0-indexed: 2), skip it
-    # Rows 4-46 (0-indexed: 3-45), Columns A-E (0-4)
+    # Rows 4-50 (0-indexed: 3-49), Columns A-E (0-4) - esteso per nuovi parametri FIX 1-4
     assumptions_data = []
-    for i in range(3, 46):  # rows 4-46 (skip row 3 which is header)
+    for i in range(3, 100):  # Leggi fino a riga 100, ma fermati quando trova sezione vuota
         if i >= len(df):
             break
         row = df.iloc[i, 0:5].values  # columns A-E
@@ -74,15 +83,35 @@ def load_from_excel_v7(excel_path: str) -> dict:
         unit = row[3] if pd.notna(row[3]) else ''
         notes = row[4] if pd.notna(row[4]) else ''
         
-        # Skip if parameter is empty or is the header row
-        if parameter and str(parameter).lower() != 'parameter':
-            assumptions_data.append({
-                'Category': category,
-                'Parameter': parameter,
-                'Value': value,  # Single value for all years
-                'Unit': unit,
-                'Notes': notes
-            })
+        # STOP CONDITIONS: fermati quando raggiungi sezione vuota o Monthly Model
+        # 1. Se parameter E category sono vuoti → fine assumptions
+        # 2. Se parameter contiene numeri tipo "1.00", "2.00" → è Monthly Model
+        if not parameter or str(parameter).strip() == '':
+            # Riga vuota, fine assumptions
+            break
+        
+        # Skip header row
+        if str(parameter).lower() == 'parameter':
+            continue
+            
+        # Se value è stringa tipo "Year" o "Month" → è header Monthly Model
+        if isinstance(parameter, str) and parameter.lower() in ['year', 'month']:
+            break
+        
+        # FILTRO PARAMETRI DEPRECATI: GrossMargin e Inf_Visitors_per_Collab
+        # Questi sono ora CALCOLATI DINAMICAMENTE, non parametri di input
+        if parameter in ['GrossMargin', 'Inf_Visitors_per_Collab']:
+            print(f"  [WARNING] Skipping deprecated parameter '{parameter}' (now calculated dynamically)")
+            continue
+        
+        # Aggiungi solo se è un parametro valido
+        assumptions_data.append({
+            'Category': category,
+            'Parameter': parameter,
+            'Value': value,  # Single value for all years
+            'Unit': unit,
+            'Notes': notes
+        })
     
     assumptions_df = pd.DataFrame(assumptions_data)
     
@@ -138,7 +167,7 @@ def load_from_excel_v7(excel_path: str) -> dict:
     else:
         yearly_df = pd.DataFrame()
     
-    print(f"✓ Loaded {len(assumptions_df)} assumptions, {len(monthly_df)} monthly rows, {len(yearly_df)} yearly rows")
+    print(f"Loaded {len(assumptions_df)} assumptions, {len(monthly_df)} monthly rows, {len(yearly_df)} yearly rows")
     
     return {
         'assumptions': assumptions_df,
@@ -228,6 +257,17 @@ def recalc_model(assumptions_df: pd.DataFrame,
          * Budget → Follower Ads (CPM-based)
          * Genera: Impressions → Reach → NewFollowers
          * Aumenta Followers_End
+    
+    NEW FEATURES (v7.2): CRESCITA AD S CON SATURAZIONE
+    ---------------------------------------------------
+    
+    C) MODELLO LOGISTICO PER FOLLOWER (no più crescita esponenziale infinita):
+       - Parametri TAM/SAM/SOM: tetti di mercato per followers e paying users
+       - Beachhead iniziale: Zurigo/Svizzera (max 50k followers, 2k paying users)
+       - Crescita ad S: lenta all'inizio (brand nuovo), rapida al centro, plateau al tetto
+       - Formula: Organic_NewFollowers = Followers × r_effective × (1 - Followers/Market_Max)
+       - Adoption Ramp: primi 24 mesi con crescita ridotta (r_effective < r_base)
+       - Cap sui paying users: non superano mai Market_Max_PayingUsers_Local
        
        - FASE 2 (Followers >= Soglia):
          * Budget → Click Ads (CPC-based)
@@ -254,7 +294,9 @@ def recalc_model(assumptions_df: pd.DataFrame,
     
     # Extract core parameters (single value for all years)
     arpu = params.get('ARPU', 20)
-    gross_margin = params.get('GrossMargin', 0.8)
+    # NOTA: GrossMargin NON è più un parametro di input - è calcolato dinamicamente
+    #       Gross_Margin_Month = Gross_Profit / MRR (mensile)
+    #       Gross_Margin_Year = SUM(Gross_Profit) / SUM(MRR) (annuale)
     conv_vs = params.get('ConvVS', 0.13)
     conv_sp = params.get('ConvSP', 0.035)
     
@@ -262,9 +304,26 @@ def recalc_model(assumptions_df: pd.DataFrame,
     churn_y2 = params.get('ChurnY2', 0.055)
     churn_y3 = params.get('ChurnY3', 0.05)
     
+    # ===== MARKET CAP PARAMETERS (TAM/SAM/SOM) - v7.2 =====
+    # Calibrati su beachhead iniziale: Zurigo/Svizzera (nicchia investitori + high earners)
+    # - Local: mercato di nicchia iniziale (hub finanziario come Zurigo)
+    # - Global: espansione internazionale (inglese, piattaforme globali)
+    market_max_followers_local = params.get('Market_Max_Followers_Local', 50000)
+    market_max_followers_global = params.get('Market_Max_Followers_Global', 1000000)
+    market_max_paying_local = params.get('Market_Max_PayingUsers_Local', 2000)
+    market_max_paying_global = params.get('Market_Max_PayingUsers_Global', 25000)
+    
+    # Per ora usiamo solo i tetti LOCAL (primi 3 anni = fase beachhead)
+    market_max_followers = market_max_followers_local
+    market_max_paying = market_max_paying_local
+    
+    # Adoption ramp: mesi necessari per raggiungere il massimo potenziale di crescita
+    # (rallenta la crescita iniziale perché brand è nuovo)
+    follower_adoption_ramp = params.get('Follower_Adoption_Ramp_Months', 24)
+    
     # Follower growth parameters
     followers_0 = params.get('Followers_0', 1000)
-    follower_growth = params.get('Follower_Monthly_Growth', 0.08)
+    follower_growth = params.get('Follower_Monthly_Growth', 0.08)  # r_base per crescita logistica
     posts_per_month = params.get('Posts_per_Month_Y1', 120)  # Same for all years
     reach_per_post = params.get('Reach_per_Post', 0.04)
     non_follower_multiplier = params.get('NonFollower_Reach_Multiplier', 0.5)
@@ -272,7 +331,13 @@ def recalc_model(assumptions_df: pd.DataFrame,
     ctr = params.get('Organic_CTR_to_Site', 0.015)
     
     # Influencer parameters
-    inf_vpc = params.get('Inf_Visitors_per_Collab', 6000)
+    # NOTA: Inf_Visitors_per_Collab NON è più un parametro di input - è SEMPRE calcolato
+    #       Formula: Inf_Visitors_per_Collab = Inf_Avg_Followers × Inf_Reach_Rate × Inf_Click_Rate
+    #       Questo valore viene usato per calcolare Inf_Visitors = Inf_Collabs × inf_vpc
+    inf_avg_followers = params.get('Inf_Avg_Followers', 50000)
+    inf_reach_rate = params.get('Inf_Reach_Rate', 0.3)
+    inf_click_rate = params.get('Inf_Click_Rate', 0.02)
+    inf_vpc = inf_avg_followers * inf_reach_rate * inf_click_rate  # CALCOLATO DINAMICAMENTE
     inf_collabs = params.get('Inf_Collabs_Y1', 1)  # Same for all years
     inf_reward = params.get('Influencer_Reward_per_Sub', 10)
     
@@ -296,10 +361,11 @@ def recalc_model(assumptions_df: pd.DataFrame,
     follower_ads_cpm = params.get('FollowerAds_CPM_EUR', 7)
     follower_ads_reach_to_follower = params.get('FollowerAds_Reach_to_Follower_Rate', 0.1)
     follower_ads_budget = params.get('FollowerAds_Budget_Y1', 500)  # Same for all years
+    follower_ads_ctr_to_site = params.get('FollowerAds_CTR_to_Site', 0.01)  # FIX 3: CTR follower ads → site
     
     # Click Ads (Fase 2: ottimizzazione per link click dopo soglia followers)
     click_ads_cpc = params.get('ClickAds_CPC_EUR', 2.0)
-    follower_threshold_for_clicks = params.get('Follower_Threshold_For_Click_Ads', 20000)
+    follower_threshold_for_clicks = params.get('Follower_Threshold_For_Click_Ads', 20000)  # FIX 2: già OK
     
     # Generate monthly data for n_years * 12 months
     n_months = n_years * 12
@@ -310,18 +376,36 @@ def recalc_model(assumptions_df: pd.DataFrame,
         year = (i // 12) + 1
         month = (i % 12) + 1
         
-        # ===== FOLLOWER GROWTH MECHANICS =====
+        # ===== FOLLOWER GROWTH MECHANICS (MODELLO AD S) =====
         if i == 0:
             followers_start = followers_0
         else:
             followers_start = monthly_data[i-1]['Followers_End']
         
-        # Organic follower growth
-        organic_follower_growth = followers_start * follower_growth
+        # Month index (1-based): 1, 2, 3, ..., n_months
+        month_index = i + 1
+        
+        # ADOPTION FACTOR: rallenta la crescita iniziale (brand nuovo)
+        # Primi mesi: adoption_factor << 1 → crescita molto ridotta
+        # Dopo follower_adoption_ramp mesi: adoption_factor = 1 → crescita al massimo potenziale
+        adoption_factor = min(month_index / follower_adoption_ramp, 1.0)
+        
+        # TASSO DI CRESCITA EFFETTIVO (modulato dalla rampa di adozione)
+        follower_growth_effective = follower_growth * adoption_factor
+        
+        # CRESCITA LOGISTICA AD S con saturazione verso market_max_followers
+        # Formula: dF/dt = F × r × (1 - F/K)
+        # - F × r: crescita proporzionale alla base (più follower → più potenziale condivisione)
+        # - (1 - F/K): fattore di saturazione (quando F → K, crescita → 0)
+        saturation_factor = max(0.0, 1.0 - followers_start / market_max_followers)
+        
+        # Nuovi follower organici del mese (NO PIÙ crescita esponenziale pura)
+        organic_follower_growth = followers_start * follower_growth_effective * saturation_factor
         
         # ===== PAID SOCIAL ADS - BIFASE LOGIC =====
         # Determina se siamo in Fase 1 (Follower Ads) o Fase 2 (Click Ads)
-        if followers_start < follower_threshold_for_clicks:
+        # SPECIALE: Se follower_threshold_for_clicks = -1, rimani SEMPRE in Fase 1 (solo Follower Ads)
+        if follower_threshold_for_clicks < 0 or followers_start < follower_threshold_for_clicks:
             # FASE 1: Budget per acquisire followers/impressions
             follower_ads_spend = follower_ads_budget
             click_ads_spend = 0.0
@@ -335,8 +419,10 @@ def recalc_model(assumptions_df: pd.DataFrame,
             # Nuovi followers acquisiti dalle campagne paid
             paid_follower_ads_new_followers = paid_follower_ads_reach * follower_ads_reach_to_follower
             
+            # FIX 3: Anche le follower ads generano visitors (CTR verso sito)
+            paid_follower_ads_visitors = paid_follower_ads_reach * follower_ads_ctr_to_site
+            
             # Click ads = 0 in Fase 1
-            paid_click_ads_clicks = 0.0
             paid_click_ads_visitors = 0.0
         else:
             # FASE 2: Budget per generare click/visitors
@@ -347,13 +433,16 @@ def recalc_model(assumptions_df: pd.DataFrame,
             paid_follower_ads_impressions = 0.0
             paid_follower_ads_reach = 0.0
             paid_follower_ads_new_followers = 0.0
+            paid_follower_ads_visitors = 0.0
             
-            # Calcola click e visitors dalle campagne click
-            paid_click_ads_clicks = click_ads_spend / click_ads_cpc
-            paid_click_ads_visitors = paid_click_ads_clicks  # 1 click ≈ 1 visitor
+            # FIX 4: Calcola visitors direttamente (rimosso Paid_ClickAds_Clicks)
+            paid_click_ads_visitors = click_ads_spend / click_ads_cpc  # 1 click ≈ 1 visitor
         
-        # Follower end = crescita organica + paid followers
+        # Follower end = start + crescita organica (logistica) + paid followers
         followers_end = followers_start + organic_follower_growth + paid_follower_ads_new_followers
+        
+        # CAP: non superare mai il tetto di mercato (safety contro errori numerici)
+        followers_end = min(followers_end, market_max_followers)
         
         # Posts per month (same for all years now)
         posts = posts_per_month
@@ -374,8 +463,8 @@ def recalc_model(assumptions_df: pd.DataFrame,
         # Other channel visitors (same for all years now)
         other_visitors = other_budget / 2.0
         
-        # Paid ads visitors (from Click Ads in Fase 2)
-        paid_ads_visitors = paid_click_ads_visitors
+        # FIX 3: Paid ads visitors (da ENTRAMBE le fasi: follower + click ads)
+        paid_ads_visitors = paid_follower_ads_visitors + paid_click_ads_visitors
         
         # Total visitors (now includes paid ads)
         visitors_total = org_visitors + inf_visitors + other_visitors + paid_ads_visitors
@@ -419,6 +508,10 @@ def recalc_model(assumptions_df: pd.DataFrame,
         # User cohort dynamics
         churned = paying_start * churn_rate
         paying_end = paying_start - churned + new_paying
+        
+        # CAP: non superare mai il tetto di mercato per paying users
+        # (coerente con il modello ad S per i follower)
+        paying_end = min(paying_end, market_max_paying)
         
         # Revenue
         mrr = paying_end * arpu
@@ -475,9 +568,9 @@ def recalc_model(assumptions_df: pd.DataFrame,
             'Paid_FollowerAds_Impressions': paid_follower_ads_impressions,
             'Paid_FollowerAds_Reach': paid_follower_ads_reach,
             'Paid_FollowerAds_NewFollowers': paid_follower_ads_new_followers,
-            'Paid_ClickAds_Clicks': paid_click_ads_clicks,
-            'Paid_ClickAds_Visitors': paid_click_ads_visitors,
-            'PaidAds_Visitors': paid_ads_visitors,
+            'Paid_FollowerAds_Visitors': paid_follower_ads_visitors,  # FIX 3: visitors da follower ads
+            'Paid_ClickAds_Visitors': paid_click_ads_visitors,  # FIX 4: rimosso Paid_ClickAds_Clicks
+            'PaidAds_Visitors': paid_ads_visitors,  # Somma di entrambi
             # ===========================
             'Visitors_Total': visitors_total,
             'Signups': signups_total,
@@ -663,6 +756,9 @@ class DataTableWidget(QWidget):
         self.table.setColumnCount(len(df.columns))
         self.table.setHorizontalHeaderLabels(df.columns.tolist())
         
+        # Selezione intera riga quando clicchi su una cella
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        
         # Populate table
         self.update_from_dataframe(df, format_as_integer=self.format_as_integer)
         
@@ -735,16 +831,16 @@ class DataTableWidget(QWidget):
         # Monthly Model Formulas
         monthly_formulas = {
             'Followers_Start': 'Previous month Followers_End (or Followers_0 for first month)',
-            'Followers_End': 'Followers_Start × (1 + Follower_Monthly_Growth)',
+            'Followers_End': 'Followers_Start × (1 + Follower_Monthly_Growth) + Paid_FollowerAds_NewFollowers',
             'Posts': 'Posts_per_Month_Y1/Y2/Y3 (based on current year)',
             'Impr_Followers': '((Followers_Start + Followers_End) / 2) × Posts × Reach_per_Post × Frequency_Impressions_per_User',
             'Impr_NonFollowers': 'Impr_Followers × NonFollower_Reach_Multiplier',
             'Social_Views': 'Impr_Followers + Impr_NonFollowers',
             'NewUnique_NonFollowers': 'Impr_NonFollowers / Frequency_Impressions_per_User',
             'Org_Visitors': 'NewUnique_NonFollowers × Organic_CTR_to_Site',
-            'Inf_Visitors': 'Inf_Collabs_Y1/Y2/Y3 × Inf_Visitors_per_Collab (based on year)',
+            'Inf_Visitors': 'Inf_Collabs × (Inf_Avg_Followers × Inf_Reach_Rate × Inf_Click_Rate) - FIX 1: calculated dynamically',
             'Other_Visitors': 'Other_Marketing_Budget_Y1/Y2/Y3 / 2.0 (assumed $2 CPC)',
-            'Visitors_Total': 'Org_Visitors + Inf_Visitors + Other_Visitors',
+            'Visitors_Total': 'Org_Visitors + Inf_Visitors + Other_Visitors + PaidAds_Visitors',
             'Signups': 'Visitors_Total × ConvVS',
             'Org_Signups': 'Signups × (Org_Visitors / Visitors_Total)',
             'Inf_Signups': 'Signups × (Inf_Visitors / Visitors_Total)',
@@ -764,9 +860,21 @@ class DataTableWidget(QWidget):
             'Inf_Marketing_Spend': 'Inf_New_Payers × Influencer_Reward_per_Sub',
             'Other_Marketing_Spend': 'Other_Marketing_Budget_Y1/Y2/Y3 (based on year)',
             'Referral_Marketing_Spend': 'Referral_New_Payers × Referral_Reward_per_Sub',
-            'Total_Marketing_Spend': 'Org_Marketing_Spend + Inf_Marketing_Spend + Other_Marketing_Spend + Referral_Marketing_Spend',
+            'FollowerAds_Spend': 'Monthly_PaidAds_Budget if Followers_Start < Follower_Threshold_For_Click_Ads, else 0 (FASE 1: Follower Acquisition)',
+            'ClickAds_Spend': 'Monthly_PaidAds_Budget if Followers_Start ≥ Follower_Threshold_For_Click_Ads, else 0 (FASE 2: Visitor Generation)',
+            'Paid_FollowerAds_Impressions': '(FollowerAds_Spend / FollowerAds_CPM_EUR) × 1000',
+            'Paid_FollowerAds_Reach': 'Paid_FollowerAds_Impressions / Frequency_Impressions_per_User',
+            'Paid_FollowerAds_NewFollowers': 'Paid_FollowerAds_Reach × FollowerAds_Reach_to_Follower_Rate',
+            'Paid_FollowerAds_Visitors': 'Paid_FollowerAds_Reach × FollowerAds_CTR_to_Site (FIX 3: visitors from follower ads)',
+            'Paid_ClickAds_Visitors': 'ClickAds_Spend / ClickAds_CPC_EUR (FIX 4: direct calculation, 1 click ≈ 1 visitor)',
+            'PaidAds_Visitors': 'Paid_FollowerAds_Visitors + Paid_ClickAds_Visitors (FIX 3: visitors from BOTH ad types)',
+            'PaidAds_Marketing_Spend': 'FollowerAds_Spend + ClickAds_Spend',
+            'Total_Marketing_Spend': 'Org_Marketing_Spend + Inf_Marketing_Spend + Other_Marketing_Spend + Referral_Marketing_Spend + PaidAds_Marketing_Spend',
             'DataSub_Cost': 'DataSub_Fee if MRR ≥ DataSub_MRR_Threshold, else 0',
             'XAPI_Cost': 'XAPI_Fee if MRR ≥ XAPI_MRR_Threshold, else 0',
+            'Direct_Costs': 'DataSub_Cost + XAPI_Cost (variable costs that scale with usage)',
+            'Gross_Profit': 'MRR - Direct_Costs (revenue minus variable costs)',
+            'Gross_Margin_Month': 'IF(MRR > 0, Gross_Profit / MRR, 0) - monthly gross margin percentage',
             'Base_Fixed_Cost': 'BaseFixedCost parameter from assumptions',
             'Total_Costs': 'Total_Marketing_Spend + DataSub_Cost + XAPI_Cost + Base_Fixed_Cost',
             'Net_Cash_Flow': 'MRR - Total_Costs',
@@ -788,10 +896,14 @@ class DataTableWidget(QWidget):
             'Inf_Marketing_Spend_EUR': 'SUM(Inf_Marketing_Spend) for all months in year',
             'Other_Marketing_Spend_EUR': 'SUM(Other_Marketing_Spend) for all months in year',
             'Referral_Marketing_Spend_EUR': 'SUM(Referral_Marketing_Spend) for all months in year',
-            'Total_Marketing_Spend_EUR': 'Org_Marketing_Spend_EUR + Inf_Marketing_Spend_EUR + Other_Marketing_Spend_EUR + Referral_Marketing_Spend_EUR',
+            'Total_Marketing_Spend_EUR': 'Org_Marketing_Spend_EUR + Inf_Marketing_Spend_EUR + Other_Marketing_Spend_EUR + Referral_Marketing_Spend_EUR + PaidAds_Marketing_Spend_EUR',
+            'PaidAds_Marketing_Spend_EUR': 'SUM(PaidAds_Marketing_Spend) for all months in year',
             'Average_CAC_EUR': 'Total_Marketing_Spend_EUR / Total_New_Customers',
+            'Revenue_Year': 'SUM(MRR) for all months in year',
+            'Gross_Profit_Year': 'SUM(Gross_Profit) for all months in year',
+            'Gross_Margin_Year': 'IF(Revenue_Year > 0, Gross_Profit_Year / Revenue_Year, 0) - yearly gross margin percentage',
             'Assumed_Monthly_Churn': 'ChurnY1/Y2/Y3 (based on current year)',
-            'LTV_EUR': '(ARPU × GrossMargin) / Assumed_Monthly_Churn',
+            'LTV_EUR': '(ARPU × Gross_Margin_Year) / Assumed_Monthly_Churn - uses DYNAMIC Gross Margin from actual results',
             'LTV_CAC_Ratio': 'LTV_EUR / Average_CAC_EUR',
             'Cumulative_Cash_EndOfYear': 'Last month of year: Cumulative_Cash',
             'Total_Org_Visitors': 'SUM(Org_Visitors) for all months in year',

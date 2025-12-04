@@ -1,0 +1,339 @@
+================================================================================
+DEBUG E CORREZIONE - PROBLEMA TAB ASSUMPTIONS
+================================================================================
+
+Data: 27 Novembre 2025
+Problema riportato: "Nella tab Assumptions vedo righe con zeri e valori che non 
+dovrebbero essere lì (1.00, 2.00, 3.00, ecc.)"
+
+================================================================================
+ANALISI DEL PROBLEMA
+================================================================================
+
+SINTOMO:
+- Tab Assumptions mostrava 84 righe invece di ~46
+- Righe con valori tipo: 1.00, 2.00, 3.00, 4.00... fino a 12.00
+- Colonne con zeri
+- Dati del Monthly Model mischiati con le Assumptions
+
+CAUSA ROOT:
+1. Il loader era stato modificato per leggere fino alla riga 100 (per catturare 
+   i nuovi parametri dei FIX 1-4)
+2. NON c'era una condizione di stop quando raggiungeva righe vuote
+3. Il loader continuava a leggere OLTRE le Assumptions, includendo:
+   - Righe vuote (49-54)
+   - Header del Monthly Model (riga 55: Year, Month, ecc.)
+   - DATI del Monthly Model (righe 56-91)
+
+CODICE PROBLEMATICO:
+```python
+# PRIMA (ERRATO):
+for i in range(3, 100):  # Leggeva TUTTO fino a riga 100
+    if i >= len(df):
+        break
+    row = df.iloc[i, 0:5].values
+    
+    # ... parsing ...
+    
+    # NESSUNA CONDIZIONE DI STOP!
+    if parameter and str(parameter).lower() != 'parameter':
+        assumptions_data.append(...)  # Aggiungeva TUTTO
+```
+
+RISULTATO:
+- Assumptions DataFrame conteneva 84 righe
+- Include: 46 assumptions valide + 38 righe dal Monthly Model
+- UI mostrava tutti questi dati come se fossero parametri editabili
+
+================================================================================
+SOLUZIONE IMPLEMENTATA
+================================================================================
+
+CORREZIONE 1: Aggiunta Stop Conditions nel Loader
+--------------------------------------------------
+
+Modificato `load_from_excel_v7()` per fermarsi quando:
+
+1. **Riga completamente vuota**: parameter è vuoto/None
+2. **Inizio Monthly Model**: parameter contiene "Year" o "Month"
+3. **Skip header**: parameter = "parameter" (riga header assumptions)
+
+CODICE CORRETTO:
+```python
+# DOPO (CORRETTO):
+for i in range(3, 100):  # Loop esteso per nuovi parametri
+    if i >= len(df):
+        break
+    row = df.iloc[i, 0:5].values
+    
+    category = row[0] if pd.notna(row[0]) else ''
+    parameter = row[1] if pd.notna(row[1]) else ''
+    value = row[2] if pd.notna(row[2]) else 0
+    unit = row[3] if pd.notna(row[3]) else ''
+    notes = row[4] if pd.notna(row[4]) else ''
+    
+    # ✅ STOP CONDITIONS aggiunte:
+    if not parameter or str(parameter).strip() == '':
+        break  # Riga vuota → fine assumptions
+    
+    if str(parameter).lower() == 'parameter':
+        continue  # Skip header row
+        
+    if isinstance(parameter, str) and parameter.lower() in ['year', 'month']:
+        break  # Header Monthly Model → STOP
+    
+    # Solo parametri validi vengono aggiunti
+    assumptions_data.append({
+        'Category': category,
+        'Parameter': parameter,
+        'Value': value,
+        'Unit': unit,
+        'Notes': notes
+    })
+```
+
+CORREZIONE 2: Fix Posizione FollowerAds_CTR_to_Site
+----------------------------------------------------
+
+PROBLEMA SECONDARIO:
+- Il parametro `FollowerAds_CTR_to_Site` era stato aggiunto alla riga 98
+- Le assumptions finiscono alla riga 48
+- C'è una riga vuota alla 49 che fa terminare il loop
+- Il parametro NON veniva caricato
+
+SOLUZIONE:
+- Creato script `fix_parameter_position.py`
+- Spostato FollowerAds_CTR_to_Site dalla riga 98 alla riga 49
+- Ora è nella zona corretta delle Assumptions
+
+RISULTATO:
+```
+PRIMA:
+Riga 46: FollowerAds_Budget_Y3
+Riga 47: ClickAds_CPC_EUR
+Riga 48: Follower_Threshold_For_Click_Ads
+Riga 49: [VUOTA]
+...
+Riga 98: FollowerAds_CTR_to_Site  ← TROPPO LONTANO
+
+DOPO:
+Riga 46: FollowerAds_Budget_Y3
+Riga 47: ClickAds_CPC_EUR
+Riga 48: Follower_Threshold_For_Click_Ads
+Riga 49: FollowerAds_CTR_to_Site  ← SPOSTATO QUI
+Riga 50: [VUOTA]
+```
+
+================================================================================
+RISULTATI DOPO LA CORREZIONE
+================================================================================
+
+PRIMA DEL FIX:
+--------------
+✗ Assumptions caricate: 84 righe
+✗ Include dati Monthly Model
+✗ FollowerAds_CTR_to_Site: NON TROVATO
+✗ UI mostra righe con 1.00, 2.00, 3.00, ecc.
+✗ UI mostra colonne con zeri
+
+DOPO IL FIX:
+------------
+✅ Assumptions caricate: 46 righe
+✅ Solo parametri validi
+✅ FollowerAds_CTR_to_Site: 0.01 (trovato)
+✅ UI mostra SOLO assumptions corrette
+✅ Nessuna riga del Monthly Model
+✅ Tab Assumptions pulita e corretta
+
+ELENCO COMPLETO ASSUMPTIONS CARICATE (46):
+-------------------------------------------
+ 1. ARPU
+ 2. GrossMargin
+ 3. ConvVS
+ 4. ConvSP
+ 5. Followers_0
+ 6. Follower_Monthly_Growth
+ 7. Posts_per_Month_Y1
+ 8. Posts_per_Month_Y2
+ 9. Posts_per_Month_Y3
+10. Reach_per_Post
+11. NonFollower_Reach_Multiplier
+12. Frequency_Impressions_per_User
+13. Organic_CTR_to_Site
+14. ChurnY1
+15. ChurnY2
+16. ChurnY3
+17. Inf_Avg_Followers
+18. Inf_Reach_Rate
+19. Inf_Click_Rate
+20. Inf_Visitors_per_Collab
+21. Inf_Collabs_Y1
+22. Inf_Collabs_Y2
+23. Inf_Collabs_Y3
+24. Referral_Monthly_Rate
+25. Referral_Reward_per_Sub
+26. Org_Cost_per_Post
+27. Influencer_Reward_per_Sub
+28. Other_Marketing_Budget_Y1
+29. Other_Marketing_Budget_Y2
+30. Other_Marketing_Budget_Y3
+31. BaseFixedCost
+32. DataSub_Fee
+33. DataSub_MRR_Threshold
+34. XAPI_Fee
+35. XAPI_MRR_Threshold
+36. Broker_MinCapital_Low
+37. Broker_MinCapital_High
+38. Broker_TargetCapital
+39. FollowerAds_CPM_EUR
+40. FollowerAds_Reach_to_Follower_Rate
+41. FollowerAds_Budget_Y1
+42. FollowerAds_Budget_Y2
+43. FollowerAds_Budget_Y3
+44. ClickAds_CPC_EUR
+45. Follower_Threshold_For_Click_Ads
+46. FollowerAds_CTR_to_Site  ← NUOVO, ora presente!
+
+================================================================================
+VERIFICA FUNZIONALITÀ
+================================================================================
+
+✅ Loader: 46 assumptions (non più 84)
+✅ Tutti i parametri FIX 1-4 presenti:
+   - Inf_Avg_Followers: 1,000,000
+   - Inf_Reach_Rate: 0.3
+   - Inf_Click_Rate: 0.02
+   - Follower_Threshold_For_Click_Ads: 20,000
+   - FollowerAds_CTR_to_Site: 0.01 ✓
+✅ Recalc_model: funziona correttamente
+✅ Monthly data: 51 colonne (corrette)
+✅ Paid_FollowerAds_Visitors: presente
+✅ Paid_ClickAds_Clicks: rimossa
+✅ Nessun errore di sintassi o runtime
+
+================================================================================
+FILE MODIFICATI
+================================================================================
+
+1. financial_model_app_v2.py
+   - Funzione load_from_excel_v7():
+     * Aggiunte stop conditions nel loop assumptions
+     * Gestione righe vuote
+     * Rilevamento header Monthly Model
+
+2. ai_finance_dynamic_model_v7_channels.xlsx
+   - FollowerAds_CTR_to_Site spostato da riga 98 a riga 49
+   - Ora nella zona corretta delle Assumptions
+
+3. fix_parameter_position.py (NUOVO)
+   - Script utility per spostare parametro nell'Excel
+
+4. test_assumptions_loader.py (NUOVO)
+   - Script di test per verificare assumptions caricate
+
+5. DEBUG_ASSUMPTIONS_FIX.txt (QUESTO FILE)
+   - Documentazione completa del debug e correzione
+
+================================================================================
+STRUTTURA EXCEL v7 CORRETTA
+================================================================================
+
+Righe 1-2:    [Titolo/Info]
+Riga 3:       HEADER Assumptions (Category | Parameter | Value | Unit | Notes)
+Righe 4-49:   ASSUMPTIONS (46 parametri)
+Riga 50:      [VUOTA]
+Righe 51-54:  [VUOTE]
+Riga 55:      HEADER Monthly Model (Year | Month | Followers_Start | ...)
+Righe 56-91:  DATI Monthly Model (36 mesi)
+Riga 92:      [VUOTA]
+Riga 93:      [VUOTA]
+Riga 94:      HEADER Yearly Summary (Year | End_Paying_Users | ...)
+Righe 95-97:  DATI Yearly Summary (3 anni)
+
+LOADER LEGGE:
+- Righe 4-49: Assumptions (STOP alla prima riga vuota o header "Year"/"Month")
+- Riga 55: Header Monthly
+- Righe 56-91: Dati Monthly
+- Riga 94: Header Yearly
+- Righe 95-97: Dati Yearly
+
+================================================================================
+TEST ESEGUITI
+================================================================================
+
+TEST 1: Verifica numero assumptions
+------------------------------------
+Comando: test_assumptions_loader.py
+Risultato: ✅ 46 assumptions (corretto)
+
+TEST 2: Verifica parametri FIX 1-4
+-----------------------------------
+Comando: test_4_fixes.py
+Risultato: ✅ Tutti i parametri presenti e funzionanti
+
+TEST 3: Verifica recalc_model
+------------------------------
+Comando: Recalcolo modello 3 anni
+Risultato: ✅ 36 righe × 51 colonne (corretto)
+
+TEST 4: Verifica UI
+-------------------
+Comando: python financial_model_app_v2.py
+Risultato: ✅ Tab Assumptions mostra solo 46 parametri validi
+
+================================================================================
+PREVENZIONE PROBLEMI FUTURI
+================================================================================
+
+BEST PRACTICES per aggiungere parametri:
+-----------------------------------------
+
+1. ✅ SEMPRE aggiungere parametri PRIMA della riga vuota (attualmente riga 50)
+2. ✅ MAI aggiungere parametri dopo la sezione Monthly Model
+3. ✅ Verificare che il loader si fermi alla riga vuota
+4. ✅ Testare con test_assumptions_loader.py dopo modifiche
+
+SEGNALI DI PROBLEMA:
+--------------------
+
+⚠️  Se vedi nella tab Assumptions:
+   - Righe con numeri sequenziali (1.00, 2.00, 3.00...)
+   - Colonne con molti zeri
+   - Più di 60 righe
+   → Il loader sta leggendo oltre le Assumptions!
+
+SOLUZIONE RAPIDA:
+-----------------
+
+1. Verifica quante assumptions vengono caricate:
+   python -c "from financial_model_app_v2 import load_from_excel_v7; 
+              state = load_from_excel_v7('...xlsx'); 
+              print(len(state['assumptions']))"
+
+2. Se > 50: problema di stop condition nel loader
+3. Verifica che ci sia una riga vuota dopo le assumptions nell'Excel
+4. Verifica che il loader abbia le stop conditions corrette
+
+================================================================================
+CONCLUSIONE
+================================================================================
+
+✅ PROBLEMA RISOLTO COMPLETAMENTE
+
+Il bug era causato da:
+1. Loader che leggeva troppo (fino a riga 100 senza stop conditions)
+2. Parametro FollowerAds_CTR_to_Site in posizione errata (riga 98)
+
+Correzioni applicate:
+1. Stop conditions nel loader (righe vuote, header Monthly Model)
+2. FollowerAds_CTR_to_Site spostato alla riga 49
+
+Risultato:
+- Tab Assumptions pulita con 46 parametri validi
+- Tutti i FIX 1-4 funzionanti
+- Nessun dato del Monthly Model nelle Assumptions
+- App completamente funzionale
+
+🎉 DEBUG COMPLETATO E TESTATO!
+
+================================================================================

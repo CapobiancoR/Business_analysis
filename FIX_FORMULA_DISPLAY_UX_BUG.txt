@@ -1,0 +1,170 @@
+================================================================================
+FIX SUMMARY: Formula Display UX Bug
+================================================================================
+
+BUG DESCRIPTION:
+When clicking on cells for newly added fields (Direct_Costs, Gross_Profit,
+Gross_Margin_Month, and all Paid Ads fields), the UI was showing:
+  "editable input field (no formula)"
+instead of displaying the actual formula for the field.
+
+ROOT CAUSE:
+The new fields were not added to the formula dictionaries in the get_formula()
+method of the ModelTable class. This caused the UI to fall back to the default
+message.
+
+SOLUTION:
+Added all 16 new fields to the appropriate formula dictionaries:
+- 12 monthly fields to `monthly_formulas` dictionary
+- 4 yearly fields to `yearly_formulas` dictionary
+
+================================================================================
+CODE CHANGES
+================================================================================
+
+File: financial_model_app_v2.py
+Location: get_formula() method (lines 733-820)
+
+CHANGE 1: Updated Followers_End formula
+------------------------------------------
+OLD: 'Followers_End': 'Followers_Start × (1 + Follower_Monthly_Growth)',
+NEW: 'Followers_End': 'Followers_Start × (1 + Follower_Monthly_Growth) + Paid_FollowerAds_NewFollowers',
+
+CHANGE 2: Updated Visitors_Total formula
+------------------------------------------
+OLD: 'Visitors_Total': 'Org_Visitors + Inf_Visitors + Other_Visitors',
+NEW: 'Visitors_Total': 'Org_Visitors + Inf_Visitors + Other_Visitors + PaidAds_Visitors',
+
+CHANGE 3: Added Paid Ads bifase fields (10 new entries)
+----------------------------------------------------------
+Added after 'Referral_Marketing_Spend':
+
+'FollowerAds_Spend': 'Monthly_PaidAds_Budget if Followers_Start < Follower_Threshold_For_Click_Ads, else 0 (FASE 1: Follower Acquisition)',
+'ClickAds_Spend': 'Monthly_PaidAds_Budget if Followers_Start ≥ Follower_Threshold_For_Click_Ads, else 0 (FASE 2: Visitor Generation)',
+'Paid_FollowerAds_Impressions': '(FollowerAds_Spend / FollowerAds_CPM_EUR) × 1000',
+'Paid_FollowerAds_Reach': 'Paid_FollowerAds_Impressions / Frequency_Impressions_per_User',
+'Paid_FollowerAds_NewFollowers': 'Paid_FollowerAds_Reach × FollowerAds_Reach_to_Follower_Rate',
+'Paid_ClickAds_Clicks': 'ClickAds_Spend / ClickAds_CPC_EUR',
+'Paid_ClickAds_Visitors': 'Paid_ClickAds_Clicks (1:1 click to visitor conversion)',
+'PaidAds_Visitors': 'Paid_ClickAds_Visitors (visitors from Paid Click Ads)',
+'PaidAds_Marketing_Spend': 'FollowerAds_Spend + ClickAds_Spend',
+
+CHANGE 4: Updated Total_Marketing_Spend formula
+-------------------------------------------------
+OLD: 'Total_Marketing_Spend': 'Org_Marketing_Spend + Inf_Marketing_Spend + Other_Marketing_Spend + Referral_Marketing_Spend',
+NEW: 'Total_Marketing_Spend': 'Org_Marketing_Spend + Inf_Marketing_Spend + Other_Marketing_Spend + Referral_Marketing_Spend + PaidAds_Marketing_Spend',
+
+CHANGE 5: Added Gross Margin fields (3 new entries)
+-----------------------------------------------------
+Added after 'XAPI_Cost':
+
+'Direct_Costs': 'DataSub_Cost + XAPI_Cost (variable costs that scale with usage)',
+'Gross_Profit': 'MRR - Direct_Costs (revenue minus variable costs)',
+'Gross_Margin_Month': 'IF(MRR > 0, Gross_Profit / MRR, 0) - monthly gross margin percentage',
+
+CHANGE 6: Updated Yearly formulas (5 new entries)
+---------------------------------------------------
+Added to yearly_formulas dictionary:
+
+'Revenue_Year': 'SUM(MRR) for all months in year',
+'Gross_Profit_Year': 'SUM(Gross_Profit) for all months in year',
+'Gross_Margin_Year': 'IF(Revenue_Year > 0, Gross_Profit_Year / Revenue_Year, 0) - yearly gross margin percentage',
+'PaidAds_Marketing_Spend_EUR': 'SUM(PaidAds_Marketing_Spend) for all months in year',
+
+CHANGE 7: Updated existing yearly formulas
+--------------------------------------------
+OLD: 'Total_Marketing_Spend_EUR': 'Org_Marketing_Spend_EUR + Inf_Marketing_Spend_EUR + Other_Marketing_Spend_EUR + Referral_Marketing_Spend_EUR',
+NEW: 'Total_Marketing_Spend_EUR': 'Org_Marketing_Spend_EUR + Inf_Marketing_Spend_EUR + Other_Marketing_Spend_EUR + Referral_Marketing_Spend_EUR + PaidAds_Marketing_Spend_EUR',
+
+OLD: 'LTV_EUR': '(ARPU × GrossMargin) / Assumed_Monthly_Churn',
+NEW: 'LTV_EUR': '(ARPU × Gross_Margin_Year) / Assumed_Monthly_Churn - uses DYNAMIC Gross Margin from actual results',
+
+================================================================================
+COMPLETE LIST OF NEW FIELDS WITH FORMULAS
+================================================================================
+
+MONTHLY MODEL (12 fields):
+---------------------------
+1.  Direct_Costs                    = DataSub_Cost + XAPI_Cost
+2.  Gross_Profit                    = MRR - Direct_Costs
+3.  Gross_Margin_Month              = IF(MRR > 0, Gross_Profit / MRR, 0)
+4.  FollowerAds_Spend               = Budget if Followers < Threshold, else 0
+5.  ClickAds_Spend                  = Budget if Followers >= Threshold, else 0
+6.  Paid_FollowerAds_Impressions    = (FollowerAds_Spend / CPM) × 1000
+7.  Paid_FollowerAds_Reach          = Impressions / Frequency
+8.  Paid_FollowerAds_NewFollowers   = Reach × Follower Rate
+9.  Paid_ClickAds_Clicks            = ClickAds_Spend / CPC
+10. Paid_ClickAds_Visitors          = Clicks (1:1 conversion)
+11. PaidAds_Visitors                = Paid_ClickAds_Visitors
+12. PaidAds_Marketing_Spend         = FollowerAds_Spend + ClickAds_Spend
+
+YEARLY SUMMARY (4 fields):
+---------------------------
+1. Revenue_Year                     = SUM(MRR) for all 12 months
+2. Gross_Profit_Year                = SUM(Gross_Profit) for all 12 months
+3. Gross_Margin_Year                = Gross_Profit_Year / Revenue_Year
+4. PaidAds_Marketing_Spend_EUR      = SUM(PaidAds_Marketing_Spend) for all 12 months
+
+================================================================================
+TESTING & VERIFICATION
+================================================================================
+
+Test Script: test_formula_display.py
+
+Test Results:
+✅ All 12 monthly fields have formula definitions
+✅ All 4 yearly fields have formula definitions
+✅ No fields show "editable input field (no formula)" anymore
+✅ Formulas display correctly in UI when cells are clicked
+
+================================================================================
+HOW TO VERIFY THE FIX
+================================================================================
+
+1. Run the application:
+   python financial_model_app_v2.py
+
+2. Navigate to "Monthly Model" tab
+
+3. Click on any of these cells:
+   - Direct_Costs
+   - Gross_Profit
+   - Gross_Margin_Month
+   - FollowerAds_Spend
+   - ClickAds_Spend
+   - Paid_FollowerAds_Impressions
+   - Paid_FollowerAds_Reach
+   - Paid_FollowerAds_NewFollowers
+   - Paid_ClickAds_Clicks
+   - Paid_ClickAds_Visitors
+   - PaidAds_Visitors
+   - PaidAds_Marketing_Spend
+
+4. Verify that the formula panel shows the correct formula
+   (NOT "editable input field (no formula)")
+
+5. Navigate to "Yearly Summary" tab
+
+6. Click on any of these cells:
+   - Revenue_Year
+   - Gross_Profit_Year
+   - Gross_Margin_Year
+   - PaidAds_Marketing_Spend_EUR
+   - LTV_EUR (verify it mentions "DYNAMIC Gross Margin")
+
+7. Verify formulas are displayed correctly
+
+================================================================================
+TECHNICAL NOTES
+================================================================================
+
+- The formula display system uses a dictionary mapping approach
+- Each field name (column name) maps to a formula string
+- The get_formula() method in the ModelTable class handles the lookup
+- Monthly and yearly formulas are stored in separate dictionaries
+- If a field is not in the dictionary, it shows the default message
+- This fix ONLY adds metadata for UI display - calculations were already working
+
+================================================================================
+STATUS: ✅ BUG FIXED - All new fields now display their formulas correctly
+================================================================================

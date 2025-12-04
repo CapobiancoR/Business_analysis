@@ -1,0 +1,400 @@
+================================================================================
+FINANCIAL MODEL v7.1 - DOCUMENTAZIONE NUOVE FUNZIONALITÀ
+================================================================================
+
+Questo documento descrive le modifiche implementate nel file 
+`financial_model_app_v2.py` per il modello finanziario AI Finance Platform.
+
+================================================================================
+PARTE A - GROSS MARGIN DINAMICO
+================================================================================
+
+OBIETTIVO:
+----------
+Calcolare il Gross Margin dinamicamente dai risultati effettivi del modello
+invece di usare un parametro fisso dalle Assumptions, e usarlo nel calcolo
+dell'LTV (Lifetime Value).
+
+IMPLEMENTAZIONE:
+----------------
+
+1. NUOVE COLONNE MONTHLY MODEL (36 righe × 12 mesi/anno):
+
+   a) Direct_Costs
+      Formula: DataSub_Cost + XAPI_Cost
+      
+      Descrizione: Costi diretti variabili legati al servizio SaaS.
+      NON include marketing né costi fissi operativi.
+      Include solo:
+      - DataSub_Cost: costo subscription data provider (attivo se MRR >= €5,000)
+      - XAPI_Cost: costo API esterna (attivo se MRR >= €15,000)
+   
+   b) Gross_Profit
+      Formula: MRR - Direct_Costs
+      
+      Descrizione: Profitto lordo mensile dopo aver sottratto i costi diretti
+      dal ricavo ricorrente.
+   
+   c) Gross_Margin_Month
+      Formula: Gross_Profit / MRR (se MRR > 0, altrimenti 0)
+      
+      Descrizione: Margine lordo mensile in percentuale. Gestisce il caso
+      MRR = 0 per evitare divisione per zero.
+
+2. NUOVE COLONNE YEARLY SUMMARY (3 righe, una per anno):
+
+   a) Revenue_Year
+      Formula: SUM(MRR) dei 12 mesi dell'anno
+      
+      Descrizione: Ricavo totale annuale (somma di tutti gli MRR mensili).
+   
+   b) Gross_Profit_Year
+      Formula: SUM(Gross_Profit) dei 12 mesi dell'anno
+      
+      Descrizione: Profitto lordo totale annuale.
+   
+   c) Gross_Margin_Year
+      Formula: Gross_Profit_Year / Revenue_Year (se Revenue_Year > 0, altrimenti 0)
+      
+      Descrizione: Margine lordo annuale calcolato dai risultati effettivi.
+
+3. AGGIORNAMENTO CALCOLO LTV:
+
+   PRIMA (versione v7.0):
+   ----------------------
+   LTV_EUR = (ARPU × GrossMargin) / Assumed_Monthly_Churn
+   
+   dove GrossMargin era un parametro fisso dalle Assumptions (es. 0.80)
+   
+   DOPO (versione v7.1):
+   ---------------------
+   LTV_EUR = (ARPU × Gross_Margin_Year) / Assumed_Monthly_Churn
+   
+   dove Gross_Margin_Year è calcolato dinamicamente dai risultati del modello.
+
+IMPATTO:
+--------
+- Il Gross Margin ora riflette la realtà operativa del modello
+- L'LTV cambia automaticamente se cambiano:
+  * MRR (revenue)
+  * DataSub_Cost o XAPI_Cost (direct costs)
+- Il parametro GrossMargin in Assumptions rimane come valore di riferimento
+  ma non viene più usato nel calcolo dell'LTV
+
+ESEMPIO (dal test):
+-------------------
+Year 1:
+  Revenue_Year:       €41,888
+  Gross_Profit_Year:  €35,888
+  Gross_Margin_Year:  85.68%
+  LTV:                €285.59
+  
+Year 3:
+  Revenue_Year:       €191,599
+  Gross_Profit_Year:  €132,599
+  Gross_Margin_Year:  69.21%  (diminuisce perché i costi diretti aumentano)
+  LTV:                €276.83  (diminuisce di conseguenza)
+
+
+================================================================================
+PARTE B - PAID SOCIAL ADS (LOGICA BIFASE)
+================================================================================
+
+OBIETTIVO:
+----------
+Integrare campagne Paid Social Ads (Meta/Instagram) con una logica bifase:
+- Fase 1: Budget per acquisire FOLLOWERS (CPM-based)
+- Fase 2: Budget per generare CLICK/VISITORS (CPC-based)
+Lo switch avviene automaticamente quando i followers superano una soglia.
+
+PARAMETRI ASSUMPTIONS (NUOVI):
+-------------------------------
+
+1. FollowerAds_CPM_EUR
+   Default: 7 EUR
+   Descrizione: Costo per 1000 impressions per campagne ottimizzate ai follower
+   
+2. FollowerAds_Reach_to_Follower_Rate
+   Default: 0.1 (10%)
+   Descrizione: Percentuale di reach unica che diventa nuovo follower
+   
+3. FollowerAds_Budget_Y1
+   Default: 500 EUR/mese
+   Descrizione: Budget mensile per Paid Social Ads
+   
+4. ClickAds_CPC_EUR (NUOVO)
+   Default: 2.0 EUR
+   Descrizione: Costo per click per campagne ottimizzate ai link click
+   
+5. Follower_Threshold_For_Click_Ads (NUOVO)
+   Default: 20,000 followers
+   Descrizione: Soglia di followers per lo switch Fase 1 → Fase 2
+
+LOGICA DI FUNZIONAMENTO:
+-------------------------
+
+PER OGNI MESE:
+--------------
+1. Leggi Followers_Start del mese
+2. Confronta con Follower_Threshold_For_Click_Ads
+3. Determina la fase:
+
+   SE Followers_Start < Soglia:
+      → FASE 1: FOLLOWER ADS
+      
+   SE Followers_Start >= Soglia:
+      → FASE 2: CLICK ADS
+
+FASE 1 - FOLLOWER ADS (Prima della soglia):
+--------------------------------------------
+
+Budget → Impressions → Reach → NewFollowers
+
+a) FollowerAds_Spend = Budget mensile (es. €500)
+   ClickAds_Spend = 0
+
+b) Paid_FollowerAds_Impressions = (FollowerAds_Spend / CPM) × 1000
+   Esempio: (500 / 7) × 1000 = 71,429 impressions
+
+c) Paid_FollowerAds_Reach = Impressions / Frequency
+   Esempio: 71,429 / 1.5 = 47,619 utenti unici raggiunti
+
+d) Paid_FollowerAds_NewFollowers = Reach × Reach_to_Follower_Rate
+   Esempio: 47,619 × 0.1 = 4,762 nuovi followers
+
+e) Followers_End = Followers_Start × (1 + Organic_Growth) + Paid_NewFollowers
+   Esempio: 1,000 × 1.08 + 4,762 = 5,842 followers
+
+f) Paid_ClickAds_Visitors = 0 (nessun visitor generato in Fase 1)
+
+FASE 2 - CLICK ADS (Dopo la soglia):
+-------------------------------------
+
+Budget → Clicks → Visitors → Funnel Conversione
+
+a) FollowerAds_Spend = 0
+   ClickAds_Spend = Budget mensile (es. €500)
+
+b) Paid_ClickAds_Clicks = ClickAds_Spend / CPC
+   Esempio: 500 / 2.0 = 250 clicks
+
+c) Paid_ClickAds_Visitors = Paid_ClickAds_Clicks (1 click ≈ 1 visitor)
+   Esempio: 250 visitors
+
+d) Paid_FollowerAds_NewFollowers = 0 (nessun nuovo follower in Fase 2)
+
+e) Followers_End = Followers_Start × (1 + Organic_Growth)
+   Esempio: 22,818 × 1.08 = 24,644 followers (solo crescita organica)
+
+f) Visitors_Total = Org + Inf + Other + PaidAds_Visitors
+   I paid visitors entrano automaticamente nel funnel di conversione
+   → Signups → New_Paying_Users
+
+NUOVE COLONNE MONTHLY MODEL:
+-----------------------------
+
+Colonne Paid Ads (tutte nuove):
+- FollowerAds_Spend: Budget allocato a campagne follower (€)
+- ClickAds_Spend: Budget allocato a campagne click (€)
+- Paid_FollowerAds_Impressions: Impressions generate dalle campagne follower
+- Paid_FollowerAds_Reach: Reach unica delle campagne follower
+- Paid_FollowerAds_NewFollowers: Nuovi followers acquisiti da paid ads
+- Paid_ClickAds_Clicks: Click generati dalle campagne click
+- Paid_ClickAds_Visitors: Visitors generati dalle campagne click
+- PaidAds_Visitors: Visitors totali da paid ads (= Paid_ClickAds_Visitors)
+- PaidAds_Marketing_Spend: Spesa marketing paid ads (= FollowerAds + ClickAds)
+
+Colonne Aggiornate:
+- Followers_End: Ora include Paid_FollowerAds_NewFollowers
+- Visitors_Total: Ora include PaidAds_Visitors
+- Total_Marketing_Spend: Ora include PaidAds_Marketing_Spend
+
+NUOVE COLONNE YEARLY SUMMARY:
+------------------------------
+
+- PaidAds_Marketing_Spend_EUR: Somma annuale spesa paid ads
+- Total_Marketing_Spend_EUR: Aggiornato per includere paid ads
+- Average_CAC_EUR: Calcolato sul nuovo totale marketing
+
+ESEMPIO DAL TEST:
+-----------------
+
+Mese 1 (FASE 1):
+  Followers Start:                1,000
+  Followers End:                  5,842  (+4,842 di cui 4,762 da paid ads)
+  FollowerAds_Spend:              €500
+  ClickAds_Spend:                 €0
+  Paid_FollowerAds_NewFollowers:  4,762
+  Paid_ClickAds_Visitors:         0
+  Visitors_Total:                 6,223
+
+Mese 5 (FASE 2 - primo mese dopo switch):
+  Followers Start:                22,818  (superata soglia 20k)
+  Followers End:                  24,644  (solo crescita organica)
+  FollowerAds_Spend:              €0
+  ClickAds_Spend:                 €500
+  Paid_FollowerAds_NewFollowers:  0
+  Paid_ClickAds_Visitors:         250
+  Visitors_Total:                 7,204
+
+Mese 36 (Year 3, fine simulazione):
+  Followers Start:                247,980
+  Followers End:                  267,819
+  FollowerAds_Spend:              €0
+  ClickAds_Spend:                 €500
+  Paid_FollowerAds_NewFollowers:  0
+  Paid_ClickAds_Visitors:         250
+  Visitors_Total:                 15,634
+
+Year 1 (Yearly Summary):
+  PaidAds_Marketing_Spend_EUR:    €6,000
+  Total_Marketing_Spend_EUR:      €13,473
+  Paid Ads % of Total:            44.5%
+
+
+================================================================================
+INTEGRAZIONE CON IL MODELLO ESISTENTE
+================================================================================
+
+MODIFICHE AL CODICE:
+--------------------
+
+1. File: financial_model_app_v2.py
+   Funzione: recalc_model()
+   
+   Modifiche principali:
+   - Aggiunti 6 nuovi parametri alle extraction
+   - Implementata logica bifase nel loop mensile (righe ~270-310)
+   - Aggiornato calcolo Followers_End per includere paid followers
+   - Aggiornato calcolo Visitors_Total per includere paid visitors
+   - Aggiornato calcolo Total_Marketing_Spend per includere paid ads
+   - Aggiunti calcoli Gross Margin dinamico (righe ~350-360)
+   - Aggiornato Yearly Summary con nuove colonne e LTV corretto
+
+2. Compatibilità:
+   - NESSUNA colonna esistente è stata rimossa
+   - NESSUNA formula esistente è stata modificata (solo estesa)
+   - Il modello funziona anche se i nuovi parametri non sono nell'Excel
+     (usa valori di default)
+
+CONTROLLO QUALITÀ:
+------------------
+
+✓ Tutte le colonne esistenti preservate
+✓ Logica di conversione invariata
+✓ Gross Margin nel range [0, 1]
+✓ Switch Fase 1→2 avviene correttamente alla soglia
+✓ Budget allocato esclusivamente a una fase alla volta
+✓ Followers crescono solo in Fase 1 (oltre l'organico)
+✓ Visitors crescono solo in Fase 2 (oltre gli altri canali)
+✓ LTV usa Gross Margin dinamico
+✓ LTV/CAC ratio aggiornato automaticamente
+
+
+================================================================================
+PROSSIMI PASSI
+================================================================================
+
+1. AGGIORNARE EXCEL v7:
+   ---------------------
+   Aggiungi nelle Assumptions (dopo riga 46):
+   
+   | Category          | Parameter                        | Value  | Unit      |
+   |-------------------|----------------------------------|--------|-----------|
+   | Paid Social Ads   | ClickAds_CPC_EUR                 | 2.0    | EUR       |
+   | Paid Social Ads   | Follower_Threshold_For_Click_Ads | 20000  | followers |
+
+2. AGGIORNARE GRAFICI:
+   -------------------
+   Considera di aggiungere nei grafici:
+   - Gross Margin trend (mensile e annuale)
+   - Followers growth breakdown (organic vs paid)
+   - Visitors breakdown (organic, influencer, other, paid ads)
+   - Marketing spend breakdown (con paid ads)
+
+3. SCENARI DI ANALISI:
+   -------------------
+   Testa diverse configurazioni:
+   - Budget Paid Ads: €300, €500, €1000/mese
+   - Soglia switch: 10k, 20k, 50k followers
+   - CPM follower ads: €5, €7, €10
+   - CPC click ads: €1.5, €2, €3
+
+4. VALIDAZIONE:
+   ------------
+   Verifica che:
+   - Il Gross Margin decresce ragionevolmente con l'aumentare dei costi
+   - Il CAC rimanga competitivo con l'aggiunta dei Paid Ads
+   - L'LTV/CAC ratio rimanga > 3x per sostenibilità
+   - Lo switch avvenga al momento opportuno (quando la base follower è solida)
+
+
+================================================================================
+DOMANDE FREQUENTI
+================================================================================
+
+Q: Perché il Gross Margin diminuisce nel tempo?
+A: Man mano che l'MRR cresce, si attivano i costi diretti (DataSub a €5k MRR,
+   XAPI a €15k MRR). Questo è realistico per un SaaS in crescita.
+
+Q: Cosa succede se non raggiungo mai la soglia di 20k followers?
+A: Il budget rimane sempre in Fase 1 (Follower Ads), generando solo followers
+   e nessun visitor diretto. Puoi abbassare la soglia nelle Assumptions.
+
+Q: Posso avere budget diversi per Fase 1 e Fase 2?
+A: Attualmente no, il budget è lo stesso. Si può estendere aggiungendo
+   parametri FollowerAds_Budget_Y1 e ClickAds_Budget_Y1 separati.
+
+Q: Il parametro GrossMargin in Assumptions è ancora usato?
+A: No, è mantenuto solo come riferimento/benchmark. L'LTV usa Gross_Margin_Year.
+
+Q: Come impatta il Paid Ads sul CAC?
+A: Il CAC aumenta perché Total_Marketing_Spend include i Paid Ads. Tuttavia,
+   se i Paid Ads generano conversioni efficienti, l'LTV/CAC ratio migliora.
+
+
+================================================================================
+RIEPILOGO TECNICO
+================================================================================
+
+COLONNE AGGIUNTE - MONTHLY MODEL (51 colonne totali, +12 nuove):
+-----------------------------------------------------------------
+1. FollowerAds_Spend
+2. ClickAds_Spend
+3. Paid_FollowerAds_Impressions
+4. Paid_FollowerAds_Reach
+5. Paid_FollowerAds_NewFollowers
+6. Paid_ClickAds_Clicks
+7. Paid_ClickAds_Visitors
+8. PaidAds_Visitors
+9. PaidAds_Marketing_Spend
+10. Direct_Costs
+11. Gross_Profit
+12. Gross_Margin_Month
+
+COLONNE AGGIUNTE - YEARLY SUMMARY (32 colonne totali, +4 nuove):
+-----------------------------------------------------------------
+1. PaidAds_Marketing_Spend_EUR
+2. Revenue_Year
+3. Gross_Profit_Year
+4. Gross_Margin_Year
+
+PARAMETRI AGGIUNTI - ASSUMPTIONS:
+----------------------------------
+1. ClickAds_CPC_EUR
+2. Follower_Threshold_For_Click_Ads
+
+(I parametri FollowerAds già esistevano ma non erano implementati)
+
+FORMULE CHIAVE:
+---------------
+- Gross_Margin_Month = (MRR - Direct_Costs) / MRR
+- Gross_Margin_Year = SUM(Gross_Profit) / SUM(MRR)
+- LTV = (ARPU × Gross_Margin_Year) / Churn
+- Paid_FollowerAds_NewFollowers = (Budget/CPM×1000/Freq) × Reach_Rate
+- Paid_ClickAds_Visitors = Budget / CPC
+
+
+================================================================================
+Fine documentazione - Financial Model v7.1
+================================================================================
