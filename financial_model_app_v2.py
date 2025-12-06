@@ -275,11 +275,13 @@ def recalc_model(assumptions_df: pd.DataFrame,
          * Aumenta Visitors_Total → entra nel funnel conversione
        
        - Parametri chiave:
+         * PaidAds_Monthly_Budget: budget mensile paid ads (uguale per tutti gli anni)
+         * PaidAds_Max_Total_Budget: budget complessivo massimo (0 = illimitato)
+           Quando raggiunto, le campagne si fermano automaticamente
          * FollowerAds_CPM_EUR: costo per 1000 impressions
          * FollowerAds_Reach_to_Follower_Rate: % reach che diventa follower
          * ClickAds_CPC_EUR: costo per click
          * Follower_Threshold_For_Click_Ads: soglia di switch (default 20k)
-         * FollowerAds_Budget_Y1: budget mensile paid ads
     
     Args:
         assumptions_df: DataFrame with assumptions (single Value column)
@@ -356,20 +358,27 @@ def recalc_model(assumptions_df: pd.DataFrame,
     xapi_fee = params.get('XAPI_Fee', 5000)
     xapi_threshold = params.get('XAPI_MRR_Threshold', 15000)
     
-    # ===== PAID SOCIAL ADS PARAMETERS (NEW) =====
+    # ===== PAID SOCIAL ADS PARAMETERS =====
+    # Budget mensile unico per tutte le campagne paid ads (uguale per tutti gli anni)
+    paid_ads_monthly_budget = params.get('PaidAds_Monthly_Budget', 500)
+    # Budget massimo totale: se > 0, le campagne si fermano quando raggiunto
+    paid_ads_max_total_budget = params.get('PaidAds_Max_Total_Budget', 0)  # 0 = illimitato
+    
     # Follower Ads (Fase 1: ottimizzazione per impressions/followers)
     follower_ads_cpm = params.get('FollowerAds_CPM_EUR', 7)
     follower_ads_reach_to_follower = params.get('FollowerAds_Reach_to_Follower_Rate', 0.1)
-    follower_ads_budget = params.get('FollowerAds_Budget_Y1', 500)  # Same for all years
-    follower_ads_ctr_to_site = params.get('FollowerAds_CTR_to_Site', 0.01)  # FIX 3: CTR follower ads → site
+    follower_ads_ctr_to_site = params.get('FollowerAds_CTR_to_Site', 0.01)  # CTR follower ads → site
     
     # Click Ads (Fase 2: ottimizzazione per link click dopo soglia followers)
     click_ads_cpc = params.get('ClickAds_CPC_EUR', 2.0)
-    follower_threshold_for_clicks = params.get('Follower_Threshold_For_Click_Ads', 20000)  # FIX 2: già OK
+    follower_threshold_for_clicks = params.get('Follower_Threshold_For_Click_Ads', 20000)
     
     # Generate monthly data for n_years * 12 months
     n_months = n_years * 12
     monthly_data = []
+    
+    # Track cumulative paid ads spend for budget cap
+    cumulative_paid_ads_spend = 0.0
     
     # Calculate all months
     for i in range(n_months):
@@ -402,12 +411,35 @@ def recalc_model(assumptions_df: pd.DataFrame,
         # Nuovi follower organici del mese (NO PIÙ crescita esponenziale pura)
         organic_follower_growth = followers_start * follower_growth_effective * saturation_factor
         
-        # ===== PAID SOCIAL ADS - BIFASE LOGIC =====
+        # ===== PAID SOCIAL ADS - BIFASE LOGIC CON BUDGET CAP =====
         # Determina se siamo in Fase 1 (Follower Ads) o Fase 2 (Click Ads)
         # SPECIALE: Se follower_threshold_for_clicks = -1, rimani SEMPRE in Fase 1 (solo Follower Ads)
-        if follower_threshold_for_clicks < 0 or followers_start < follower_threshold_for_clicks:
+        
+        # Calcola quanto budget è ancora disponibile questo mese
+        # Se paid_ads_max_total_budget = 0, budget illimitato
+        if paid_ads_max_total_budget > 0:
+            budget_remaining = paid_ads_max_total_budget - cumulative_paid_ads_spend
+            budget_this_month = min(paid_ads_monthly_budget, max(0, budget_remaining))
+        else:
+            budget_this_month = paid_ads_monthly_budget
+        
+        # STOP ADS SE MERCATO FOLLOWER SATURO
+        # Se saturation_factor < 5% (mercato quasi saturo), non ha senso spendere per acquisire follower
+        # perché la crescita organica + paid non porterà nuovi follower significativi
+        market_saturated = saturation_factor < 0.05
+        
+        if market_saturated:
+            # MERCATO SATURO: ferma tutte le campagne paid ads
+            follower_ads_spend = 0.0
+            click_ads_spend = 0.0
+            paid_follower_ads_impressions = 0.0
+            paid_follower_ads_reach = 0.0
+            paid_follower_ads_new_followers = 0.0
+            paid_follower_ads_visitors = 0.0
+            paid_click_ads_visitors = 0.0
+        elif budget_this_month > 0 and (follower_threshold_for_clicks < 0 or followers_start < follower_threshold_for_clicks):
             # FASE 1: Budget per acquisire followers/impressions
-            follower_ads_spend = follower_ads_budget
+            follower_ads_spend = budget_this_month
             click_ads_spend = 0.0
             
             # Calcola impressions generate dalle campagne follower
@@ -419,15 +451,15 @@ def recalc_model(assumptions_df: pd.DataFrame,
             # Nuovi followers acquisiti dalle campagne paid
             paid_follower_ads_new_followers = paid_follower_ads_reach * follower_ads_reach_to_follower
             
-            # FIX 3: Anche le follower ads generano visitors (CTR verso sito)
+            # Anche le follower ads generano visitors (CTR verso sito)
             paid_follower_ads_visitors = paid_follower_ads_reach * follower_ads_ctr_to_site
             
             # Click ads = 0 in Fase 1
             paid_click_ads_visitors = 0.0
-        else:
+        elif budget_this_month > 0:
             # FASE 2: Budget per generare click/visitors
             follower_ads_spend = 0.0
-            click_ads_spend = follower_ads_budget  # Stesso budget, diversa ottimizzazione
+            click_ads_spend = budget_this_month  # Stesso budget, diversa ottimizzazione
             
             # Follower ads = 0 in Fase 2
             paid_follower_ads_impressions = 0.0
@@ -435,8 +467,20 @@ def recalc_model(assumptions_df: pd.DataFrame,
             paid_follower_ads_new_followers = 0.0
             paid_follower_ads_visitors = 0.0
             
-            # FIX 4: Calcola visitors direttamente (rimosso Paid_ClickAds_Clicks)
+            # Calcola visitors direttamente
             paid_click_ads_visitors = click_ads_spend / click_ads_cpc  # 1 click ≈ 1 visitor
+        else:
+            # BUDGET ESAURITO: campagne ferme
+            follower_ads_spend = 0.0
+            click_ads_spend = 0.0
+            paid_follower_ads_impressions = 0.0
+            paid_follower_ads_reach = 0.0
+            paid_follower_ads_new_followers = 0.0
+            paid_follower_ads_visitors = 0.0
+            paid_click_ads_visitors = 0.0
+        
+        # Aggiorna spesa cumulativa
+        cumulative_paid_ads_spend += (follower_ads_spend + click_ads_spend)
         
         # Follower end = start + crescita organica (logistica) + paid followers
         followers_end = followers_start + organic_follower_growth + paid_follower_ads_new_followers
@@ -562,14 +606,15 @@ def recalc_model(assumptions_df: pd.DataFrame,
             'Org_Visitors': org_visitors,
             'Inf_Visitors': inf_visitors,
             'Other_Visitors': other_visitors,
-            # === PAID ADS COLUMNS (NEW) ===
+            # === PAID ADS COLUMNS ===
             'FollowerAds_Spend': follower_ads_spend,
             'ClickAds_Spend': click_ads_spend,
+            'Cumulative_PaidAds_Spend': cumulative_paid_ads_spend,  # Budget speso cumulativo
             'Paid_FollowerAds_Impressions': paid_follower_ads_impressions,
             'Paid_FollowerAds_Reach': paid_follower_ads_reach,
             'Paid_FollowerAds_NewFollowers': paid_follower_ads_new_followers,
-            'Paid_FollowerAds_Visitors': paid_follower_ads_visitors,  # FIX 3: visitors da follower ads
-            'Paid_ClickAds_Visitors': paid_click_ads_visitors,  # FIX 4: rimosso Paid_ClickAds_Clicks
+            'Paid_FollowerAds_Visitors': paid_follower_ads_visitors,
+            'Paid_ClickAds_Visitors': paid_click_ads_visitors,
             'PaidAds_Visitors': paid_ads_visitors,  # Somma di entrambi
             # ===========================
             'Visitors_Total': visitors_total,
@@ -860,8 +905,9 @@ class DataTableWidget(QWidget):
             'Inf_Marketing_Spend': 'Inf_New_Payers × Influencer_Reward_per_Sub',
             'Other_Marketing_Spend': 'Other_Marketing_Budget_Y1/Y2/Y3 (based on year)',
             'Referral_Marketing_Spend': 'Referral_New_Payers × Referral_Reward_per_Sub',
-            'FollowerAds_Spend': 'Monthly_PaidAds_Budget if Followers_Start < Follower_Threshold_For_Click_Ads, else 0 (FASE 1: Follower Acquisition)',
-            'ClickAds_Spend': 'Monthly_PaidAds_Budget if Followers_Start ≥ Follower_Threshold_For_Click_Ads, else 0 (FASE 2: Visitor Generation)',
+            'FollowerAds_Spend': 'PaidAds_Monthly_Budget se Followers_Start < soglia, else 0 (FASE 1: Follower Acquisition). Stop quando raggiunto PaidAds_Max_Total_Budget',
+            'ClickAds_Spend': 'PaidAds_Monthly_Budget se Followers_Start ≥ soglia, else 0 (FASE 2: Visitor Generation). Stop quando raggiunto PaidAds_Max_Total_Budget',
+            'Cumulative_PaidAds_Spend': 'Somma cumulativa di FollowerAds_Spend + ClickAds_Spend da inizio simulazione. Quando raggiunge PaidAds_Max_Total_Budget, le campagne si fermano.',
             'Paid_FollowerAds_Impressions': '(FollowerAds_Spend / FollowerAds_CPM_EUR) × 1000',
             'Paid_FollowerAds_Reach': 'Paid_FollowerAds_Impressions / Frequency_Impressions_per_User',
             'Paid_FollowerAds_NewFollowers': 'Paid_FollowerAds_Reach × FollowerAds_Reach_to_Follower_Rate',
@@ -1030,110 +1076,167 @@ class DataTableWidget(QWidget):
 
 
 class ChartsWidget(QWidget):
-    """Widget to display interactive matplotlib charts with hover tooltips and zoom/pan."""
+    """Widget to display interactive matplotlib charts with scroll support."""
     
     def __init__(self):
         super().__init__()
         
-        layout = QVBoxLayout()
+        from PyQt6.QtWidgets import QScrollArea
         
-        # Create matplotlib figure
-        self.figure = Figure(figsize=(12, 10))
+        # Main layout
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create scroll area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        
+        # Container widget for scroll area
+        container = QWidget()
+        container_layout = QVBoxLayout()
+        
+        # Create matplotlib figure - dimensioni ragionevoli
+        self.figure = Figure(figsize=(12, 14), dpi=80)
         self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumSize(900, 1000)
         
         # Add navigation toolbar for zoom/pan
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
-        self.setLayout(layout)
+        container_layout.addWidget(self.toolbar)
+        container_layout.addWidget(self.canvas)
+        container.setLayout(container_layout)
         
-        # Store cursors for cleanup
-        self.cursors = []
+        scroll_area.setWidget(container)
+        main_layout.addWidget(scroll_area)
+        self.setLayout(main_layout)
     
     def update_charts(self, monthly_df: pd.DataFrame):
-        """Update all charts with new data and add interactive features."""
-        # Clear previous cursors
-        for cursor in self.cursors:
-            cursor.remove()
-        self.cursors.clear()
-        
+        """Update all charts with new data (no hover for performance)."""
         self.figure.clear()
         
-        # Create 3 subplots
-        ax1 = self.figure.add_subplot(3, 1, 1)
-        ax2 = self.figure.add_subplot(3, 1, 2)
-        ax3 = self.figure.add_subplot(3, 1, 3)
+        # Create 6 subplots (3 righe x 2 colonne)
+        ax1 = self.figure.add_subplot(3, 2, 1)
+        ax2 = self.figure.add_subplot(3, 2, 2)
+        ax3 = self.figure.add_subplot(3, 2, 3)
+        ax4 = self.figure.add_subplot(3, 2, 4)
+        ax5 = self.figure.add_subplot(3, 2, 5)
+        ax6 = self.figure.add_subplot(3, 2, 6)
         
         # Create month index
-        month_index = range(1, len(monthly_df) + 1)
+        month_index = list(range(1, len(monthly_df) + 1))
         
-        # Chart 1: MRR over time
-        line1, = ax1.plot(month_index, monthly_df['MRR'], marker='o', linewidth=2, 
-                markersize=4, color='#2E86AB', label='MRR')
-        ax1.set_title('Monthly Recurring Revenue (MRR)', fontweight='bold', fontsize=12)
-        ax1.set_xlabel('Month')
-        ax1.set_ylabel('MRR (EUR)')
+        # ===== Chart 1: MRR over time =====
+        ax1.plot(month_index, monthly_df['MRR'], linewidth=2, color='#2E86AB', label='MRR')
+        ax1.set_title('Monthly Recurring Revenue (MRR)', fontweight='bold', fontsize=10)
+        ax1.set_xlabel('Month', fontsize=8)
+        ax1.set_ylabel('MRR (EUR)', fontsize=8)
         ax1.grid(True, alpha=0.3)
         ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'€{x:,.0f}'))
+        ax1.tick_params(axis='both', labelsize=7)
         
-        # Add hover tooltip for MRR
-        cursor1 = mplcursors.cursor(line1, hover=True)
-        @cursor1.connect("add")
-        def on_add_mrr(sel):
-            idx = int(sel.index)
-            year = int(monthly_df.iloc[idx]['Year'])
-            month = int(monthly_df.iloc[idx]['Month'])
-            value = monthly_df.iloc[idx]['MRR']
-            sel.annotation.set_text(f'Year {year}, Month {month}\nMRR: €{value:,.0f}')
-            sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9)
-        self.cursors.append(cursor1)
+        # ===== Chart 2: Paying Users & Followers =====
+        ax2.plot(month_index, monthly_df['Paying_Users_End'], linewidth=2, color='#06d6a0', label='Paying Users')
+        ax2.set_xlabel('Month', fontsize=8)
+        ax2.set_ylabel('Paying Users', color='#06d6a0', fontsize=8)
+        ax2.tick_params(axis='y', labelcolor='#06d6a0', labelsize=7)
+        ax2.tick_params(axis='x', labelsize=7)
         
-        # Chart 2: Paying Users over time
-        line2, = ax2.plot(month_index, monthly_df['Paying_Users_End'], marker='s', 
-                linewidth=2, markersize=4, color='#06d6a0', label='Paying Users')
-        ax2.set_title('Paying Users (End of Month)', fontweight='bold', fontsize=12)
-        ax2.set_xlabel('Month')
-        ax2.set_ylabel('Users')
+        # Asse secondario per Followers
+        ax2b = ax2.twinx()
+        ax2b.plot(month_index, monthly_df['Followers_End'], linewidth=2, color='#9b59b6', label='Followers')
+        ax2b.set_ylabel('Followers', color='#9b59b6', fontsize=8)
+        ax2b.tick_params(axis='y', labelcolor='#9b59b6', labelsize=7)
+        
+        ax2.set_title('Paying Users & Followers Growth', fontweight='bold', fontsize=10)
         ax2.grid(True, alpha=0.3)
-        ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
         
-        # Add hover tooltip for Users
-        cursor2 = mplcursors.cursor(line2, hover=True)
-        @cursor2.connect("add")
-        def on_add_users(sel):
-            idx = int(sel.index)
-            year = int(monthly_df.iloc[idx]['Year'])
-            month = int(monthly_df.iloc[idx]['Month'])
-            value = monthly_df.iloc[idx]['Paying_Users_End']
-            sel.annotation.set_text(f'Year {year}, Month {month}\nUsers: {value:,.0f}')
-            sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9)
-        self.cursors.append(cursor2)
+        # Legend manuale
+        from matplotlib.lines import Line2D
+        legend_elements = [Line2D([0], [0], color='#06d6a0', lw=2, label='Paying Users'),
+                          Line2D([0], [0], color='#9b59b6', lw=2, label='Followers')]
+        ax2.legend(handles=legend_elements, loc='upper left', fontsize=7)
         
-        # Chart 3: Cumulative Cash over time
-        line3, = ax3.plot(month_index, monthly_df['Cumulative_Cash'], marker='D', 
-                linewidth=2, markersize=4, color='#e63946', label='Cumulative Cash')
+        # ===== Chart 3: Cumulative Cash Flow =====
+        cash_values = monthly_df['Cumulative_Cash'].values
+        ax3.plot(month_index, cash_values, linewidth=2, color='#e63946', label='Cumulative Cash')
         ax3.axhline(y=0, color='black', linestyle='--', linewidth=1, alpha=0.5, label='Break-even')
-        ax3.set_title('Cumulative Cash Flow', fontweight='bold', fontsize=12)
-        ax3.set_xlabel('Month')
-        ax3.set_ylabel('Cash (EUR)')
+        ax3.set_title('Cumulative Cash Flow', fontweight='bold', fontsize=10)
+        ax3.set_xlabel('Month', fontsize=8)
+        ax3.set_ylabel('Cash (EUR)', fontsize=8)
         ax3.grid(True, alpha=0.3)
         ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'€{x:,.0f}'))
-        ax3.legend()
+        ax3.legend(fontsize=7)
+        ax3.tick_params(axis='both', labelsize=7)
         
-        # Add hover tooltip for Cash
-        cursor3 = mplcursors.cursor(line3, hover=True)
-        @cursor3.connect("add")
-        def on_add_cash(sel):
-            idx = int(sel.index)
-            year = int(monthly_df.iloc[idx]['Year'])
-            month = int(monthly_df.iloc[idx]['Month'])
-            value = monthly_df.iloc[idx]['Cumulative_Cash']
-            sel.annotation.set_text(f'Year {year}, Month {month}\nCash: €{value:,.0f}')
-            sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9)
-        self.cursors.append(cursor3)
+        # Fill area sopra/sotto zero
+        ax3.fill_between(month_index, cash_values, 0, 
+                        where=[v >= 0 for v in cash_values], alpha=0.3, color='green', interpolate=True)
+        ax3.fill_between(month_index, cash_values, 0, 
+                        where=[v < 0 for v in cash_values], alpha=0.3, color='red', interpolate=True)
         
-        self.figure.tight_layout()
+        # ===== Chart 4: Marketing Spend Breakdown (Stacked Area) =====
+        ax4.stackplot(month_index, 
+                     monthly_df['Org_Marketing_Spend'].values,
+                     monthly_df['Inf_Marketing_Spend'].values,
+                     monthly_df['PaidAds_Marketing_Spend'].values,
+                     monthly_df['Referral_Marketing_Spend'].values,
+                     monthly_df['Other_Marketing_Spend'].values,
+                     labels=['Organic', 'Influencer', 'Paid Ads', 'Referral', 'Other'],
+                     colors=['#3498db', '#e74c3c', '#f39c12', '#2ecc71', '#9b59b6'],
+                     alpha=0.7)
+        ax4.set_title('Marketing Spend by Channel', fontweight='bold', fontsize=10)
+        ax4.set_xlabel('Month', fontsize=8)
+        ax4.set_ylabel('Spend (EUR)', fontsize=8)
+        ax4.grid(True, alpha=0.3)
+        ax4.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'€{x:,.0f}'))
+        ax4.legend(loc='upper left', fontsize=6)
+        ax4.tick_params(axis='both', labelsize=7)
+        
+        # ===== Chart 5: Conversion Funnel (Visitors → Signups → New Payers) =====
+        ax5.plot(month_index, monthly_df['Visitors_Total'].values, linewidth=2, 
+                color='#3498db', label='Visitors', alpha=0.8)
+        ax5.plot(month_index, monthly_df['Signups'].values, linewidth=2, 
+                color='#f39c12', label='Signups', alpha=0.8)
+        ax5.plot(month_index, monthly_df['New_Paying_Users'].values, linewidth=2, 
+                color='#27ae60', label='New Paying', alpha=0.8)
+        ax5.set_title('Conversion Funnel', fontweight='bold', fontsize=10)
+        ax5.set_xlabel('Month', fontsize=8)
+        ax5.set_ylabel('Count', fontsize=8)
+        ax5.grid(True, alpha=0.3)
+        ax5.legend(fontsize=7)
+        # Usa scala log solo se i valori sono > 0
+        if monthly_df['New_Paying_Users'].min() > 0:
+            ax5.set_yscale('log')
+        ax5.tick_params(axis='both', labelsize=7)
+        
+        # ===== Chart 6: Unit Economics (Gross Margin % & Net Cash Flow) =====
+        gross_margin_pct = monthly_df['Gross_Margin_Month'].values * 100
+        ax6.plot(month_index, gross_margin_pct, linewidth=2, color='#16a085', label='Gross Margin %')
+        ax6.set_ylabel('Gross Margin (%)', color='#16a085', fontsize=8)
+        ax6.tick_params(axis='y', labelcolor='#16a085', labelsize=7)
+        ax6.tick_params(axis='x', labelsize=7)
+        ax6.set_ylim(0, 105)
+        
+        # Net Cash Flow sull'asse destro
+        ax6b = ax6.twinx()
+        ax6b.plot(month_index, monthly_df['Net_Cash_Flow'].values, linewidth=2, color='#c0392b', label='Net Cash Flow')
+        ax6b.axhline(y=0, color='black', linestyle='--', linewidth=0.5, alpha=0.5)
+        ax6b.set_ylabel('Net Cash Flow (EUR)', color='#c0392b', fontsize=8)
+        ax6b.tick_params(axis='y', labelcolor='#c0392b', labelsize=7)
+        ax6b.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'€{x:,.0f}'))
+        
+        ax6.set_title('Unit Economics: Gross Margin & Cash Flow', fontweight='bold', fontsize=10)
+        ax6.set_xlabel('Month', fontsize=8)
+        ax6.grid(True, alpha=0.3)
+        
+        legend_elements6 = [Line2D([0], [0], color='#16a085', lw=2, label='Gross Margin %'),
+                           Line2D([0], [0], color='#c0392b', lw=2, label='Net Cash Flow')]
+        ax6.legend(handles=legend_elements6, loc='lower right', fontsize=7)
+        
+        self.figure.tight_layout(pad=2.0)
         self.canvas.draw()
 
 
