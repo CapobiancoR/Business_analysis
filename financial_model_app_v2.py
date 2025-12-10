@@ -268,7 +268,50 @@ def recalc_model(assumptions_df: pd.DataFrame,
        - Formula: Organic_NewFollowers = Followers × r_effective × (1 - Followers/Market_Max)
        - Adoption Ramp: primi 24 mesi con crescita ridotta (r_effective < r_base)
        - Cap sui paying users: non superano mai Market_Max_PayingUsers_Local
+    
+    NEW FEATURES (v7.3): NUOVA LOGICA REFERRAL
+    ------------------------------------------
+    
+    D) REFERRAL CON SATURAZIONE E PROBABILITÀ ONE-TIME:
+       - PRIMA: Referral_New_Payers = Paying_Users_Start × referral_rate
+         → Problema: ricalcolava la probabilità ogni mese sugli stessi utenti
        
+       - ADESSO: Referral_New_Payers = Signups × referral_rate × referral_capacity
+         → Ogni NUOVO registrato ha 2% probabilità di invitare 1 amico (una volta sola)
+         → La saturazione di mercato frena i referral quando ci si avvicina al tetto
+       
+       - Parametri:
+         * Referral_Monthly_Rate (default 0.02): probabilità lifetime che un nuovo
+           utente registrato inviti un amico (applicata alla coorte del mese)
+         * referral_capacity = max(0, 1 - Paying_Users_Start / Market_Max_PayingUsers)
+           Frena i referral quando il mercato è quasi pieno
+    
+    NEW FEATURES (v7.4): CONVERSIONE DA FREE ESISTENTI A PAID
+    ---------------------------------------------------------
+    
+    E) SECONDA FONTE DI CONVERSIONE FREE → PAID:
+       - PRIMA: Solo i nuovi signup del mese potevano convertire a paid
+       
+       - ADESSO: Anche gli utenti free GIÀ ESISTENTI convertono ogni mese
+         → Una percentuale degli utenti free "attivi" diventa pagante
+         → Riflette la dinamica reale SaaS dove utenti upgrade dopo mesi di utilizzo
+       
+       - Nuovi parametri:
+         * Existing_Free_to_Paid_Monthly_Conv_Rate (default 0.0075): 0.75% al mese
+         * Free_Active_Share (default 0.5): 50% dei free users sono "attivi"
+       
+       - Formula:
+         * Free_Active_Users = Free_Users_Start × Free_Active_Share
+         * New_Payers_from_Existing_Free = Free_Active_Users × Conv_Rate
+       
+       - Nuove colonne output:
+         * New_Payers_from_New_Signups: conversione immediata da nuovi signup
+         * New_Payers_from_Existing_Free: conversione ritardata da free esistenti
+         * New_Payers_from_Referral: nuovi paganti da referral
+         * Free_Active_Users: utenti free attivi (50% default)
+       
+       - New_Paying_Users ora = somma delle 3 componenti sopra
+
        - FASE 2 (Followers >= Soglia):
          * Budget → Click Ads (CPC-based)
          * Genera: Clicks → Visitors
@@ -302,9 +345,9 @@ def recalc_model(assumptions_df: pd.DataFrame,
     conv_vs = params.get('ConvVS', 0.13)
     conv_sp = params.get('ConvSP', 0.035)
     
-    churn_y1 = params.get('ChurnY1', 0.06)
-    churn_y2 = params.get('ChurnY2', 0.055)
-    churn_y3 = params.get('ChurnY3', 0.05)
+    churn_y1 = params.get('Churn_Rate', params.get('ChurnY1', 0.06))  # Unified churn rate
+    churn_y2 = churn_y1  # Same for all years
+    churn_y3 = churn_y1  # Same for all years
     
     # ===== MARKET CAP PARAMETERS (TAM/SAM/SOM) - v7.2 =====
     # Calibrati su beachhead iniziale: Zurigo/Svizzera (nicchia investitori + high earners)
@@ -316,12 +359,16 @@ def recalc_model(assumptions_df: pd.DataFrame,
     market_max_paying_global = params.get('Market_Max_PayingUsers_Global', 25000)
     
     # Per ora usiamo solo i tetti LOCAL (primi 3 anni = fase beachhead)
+    # NOTA: la logica passa automaticamente a GLOBAL quando i follower saturano il mercato locale
     market_max_followers = market_max_followers_local
     market_max_paying = market_max_paying_local
     
     # Adoption ramp: mesi necessari per raggiungere il massimo potenziale di crescita
     # (rallenta la crescita iniziale perché brand è nuovo)
     follower_adoption_ramp = params.get('Follower_Adoption_Ramp_Months', 24)
+    
+    # Global adoption ramp: quando si passa al mercato globale, la crescita riparte lentamente
+    global_adoption_ramp = params.get('Global_Adoption_Ramp_Months', 12)
     
     # Follower growth parameters
     followers_0 = params.get('Followers_0', 1000)
@@ -347,12 +394,18 @@ def recalc_model(assumptions_df: pd.DataFrame,
     referral_rate = params.get('Referral_Monthly_Rate', 0.02)
     referral_reward = params.get('Referral_Reward_per_Sub', 10)
     
+    # ===== FREE TO PAID CONVERSION PARAMETERS =====
+    # Conversione da utenti free ESISTENTI a paganti (non solo nuovi signups)
+    existing_free_to_paid_rate = params.get('Existing_Free_to_Paid_Monthly_Conv_Rate', 0.0075)  # 0.75% al mese
+    free_active_share = params.get('Free_Active_Share', 0.5)  # 50% dei free users sono attivi
+    
     # Other channel parameters
     org_cost_per_post = params.get('Org_Cost_per_Post', 1)
-    other_budget = params.get('Other_Marketing_Budget_Y1', 200)  # Same for all years
+    other_budget = params.get('Other_Marketing_Budget', params.get('Other_Marketing_Budget_Y1', 200))  # Unified for all years
     
     # Cost parameters
     base_fixed_cost = params.get('BaseFixedCost', 1000)
+    fixed_cost_annual_growth = params.get('FixedCost_Annual_Growth', 0.05)  # 5% crescita annua default
     datasub_fee = params.get('DataSub_Fee', 2000)
     datasub_threshold = params.get('DataSub_MRR_Threshold', 5000)
     xapi_fee = params.get('XAPI_Fee', 5000)
@@ -361,7 +414,9 @@ def recalc_model(assumptions_df: pd.DataFrame,
     # ===== PAID SOCIAL ADS PARAMETERS =====
     # Budget mensile unico per tutte le campagne paid ads (uguale per tutti gli anni)
     paid_ads_monthly_budget = params.get('PaidAds_Monthly_Budget', 500)
-    # Budget massimo totale: se > 0, le campagne si fermano quando raggiunto
+    # Budget massimo ANNUALE: se > 0, le campagne si fermano quando raggiunto nell'anno
+    paid_ads_max_annual_budget = params.get('PaidAds_Max_Annual_Budget', 0)  # 0 = illimitato
+    # Budget massimo TOTALE (lifetime): se > 0, le campagne si fermano quando raggiunto complessivamente
     paid_ads_max_total_budget = params.get('PaidAds_Max_Total_Budget', 0)  # 0 = illimitato
     
     # Follower Ads (Fase 1: ottimizzazione per impressions/followers)
@@ -380,6 +435,17 @@ def recalc_model(assumptions_df: pd.DataFrame,
     # Track cumulative paid ads spend for budget cap
     cumulative_paid_ads_spend = 0.0
     
+    # Track annual paid ads spend (resets each year)
+    annual_paid_ads_spend = 0.0
+    current_tracking_year = 1
+    
+    # Track when global market phase starts (month index when local market saturated)
+    global_phase_start_month = None
+    
+    # Track cumulative marketing spend and new customers for CAC calculation
+    cumulative_marketing_spend = 0.0
+    cumulative_new_customers = 0
+    
     # Calculate all months
     for i in range(n_months):
         year = (i // 12) + 1
@@ -394,41 +460,79 @@ def recalc_model(assumptions_df: pd.DataFrame,
         # Month index (1-based): 1, 2, 3, ..., n_months
         month_index = i + 1
         
-        # ADOPTION FACTOR: rallenta la crescita iniziale (brand nuovo)
-        # Primi mesi: adoption_factor << 1 → crescita molto ridotta
-        # Dopo follower_adoption_ramp mesi: adoption_factor = 1 → crescita al massimo potenziale
-        adoption_factor = min(month_index / follower_adoption_ramp, 1.0)
+        # ===== DETECT LOCAL → GLOBAL MARKET TRANSITION =====
+        # Quando i follower raggiungono ~95% del mercato locale, passiamo al mercato globale
+        local_saturation_ratio = followers_start / market_max_followers_local
+        is_in_global_phase = local_saturation_ratio >= 0.95
+        
+        # Registra quando inizia la fase globale (una volta sola)
+        if is_in_global_phase and global_phase_start_month is None:
+            global_phase_start_month = month_index
+        
+        # ===== CALCOLA IL TETTO DI MERCATO CORRENTE PER GLI ADS =====
+        # - LOCAL: usa market_max_followers_local
+        # - GLOBAL: usa market_max_followers_global (espansione internazionale)
+        if is_in_global_phase:
+            ads_market_max = market_max_followers_global
+            # Mesi trascorsi dall'inizio della fase globale
+            months_in_global = month_index - global_phase_start_month + 1
+            # Nuova rampa di adozione per il mercato globale
+            ads_adoption_factor = min(months_in_global / global_adoption_ramp, 1.0)
+            # Saturazione rispetto al mercato GLOBALE
+            ads_saturation_factor = max(0.0, 1.0 - followers_start / ads_market_max)
+        else:
+            ads_market_max = market_max_followers_local
+            # Adoption factor normale (rampa locale)
+            ads_adoption_factor = min(month_index / follower_adoption_ramp, 1.0)
+            # Saturazione rispetto al mercato LOCALE
+            ads_saturation_factor = max(0.0, 1.0 - followers_start / ads_market_max)
+        
+        # ===== CRESCITA ORGANICA (sempre rispetto al tetto attuale) =====
+        # NOTA: La crescita organica rallenta quando raggiungiamo il tetto locale,
+        # ma nel mercato globale c'è ancora spazio per crescere
+        if is_in_global_phase:
+            # Nel mercato globale: crescita organica rispetto al tetto globale
+            organic_saturation_factor = max(0.0, 1.0 - followers_start / market_max_followers_global)
+            organic_adoption_factor = min(months_in_global / global_adoption_ramp, 1.0)
+        else:
+            # Nel mercato locale: crescita organica rispetto al tetto locale
+            organic_saturation_factor = max(0.0, 1.0 - followers_start / market_max_followers_local)
+            organic_adoption_factor = min(month_index / follower_adoption_ramp, 1.0)
         
         # TASSO DI CRESCITA EFFETTIVO (modulato dalla rampa di adozione)
-        follower_growth_effective = follower_growth * adoption_factor
+        follower_growth_effective = follower_growth * organic_adoption_factor
         
-        # CRESCITA LOGISTICA AD S con saturazione verso market_max_followers
-        # Formula: dF/dt = F × r × (1 - F/K)
-        # - F × r: crescita proporzionale alla base (più follower → più potenziale condivisione)
-        # - (1 - F/K): fattore di saturazione (quando F → K, crescita → 0)
-        saturation_factor = max(0.0, 1.0 - followers_start / market_max_followers)
-        
-        # Nuovi follower organici del mese (NO PIÙ crescita esponenziale pura)
-        organic_follower_growth = followers_start * follower_growth_effective * saturation_factor
+        # Nuovi follower organici del mese (crescita logistica ad S)
+        organic_follower_growth = followers_start * follower_growth_effective * organic_saturation_factor
         
         # ===== PAID SOCIAL ADS - BIFASE LOGIC CON BUDGET CAP =====
         # Determina se siamo in Fase 1 (Follower Ads) o Fase 2 (Click Ads)
         # SPECIALE: Se follower_threshold_for_clicks = -1, rimani SEMPRE in Fase 1 (solo Follower Ads)
         
+        # Reset annual spend tracker at the start of each new year
+        if year != current_tracking_year:
+            annual_paid_ads_spend = 0.0
+            current_tracking_year = year
+        
         # Calcola quanto budget è ancora disponibile questo mese
-        # Se paid_ads_max_total_budget = 0, budget illimitato
+        # Considera ENTRAMBI i limiti: annuale e totale (lifetime)
+        budget_this_month = paid_ads_monthly_budget
+        
+        # Applica limite ANNUALE (se configurato)
+        if paid_ads_max_annual_budget > 0:
+            annual_remaining = paid_ads_max_annual_budget - annual_paid_ads_spend
+            budget_this_month = min(budget_this_month, max(0, annual_remaining))
+        
+        # Applica limite TOTALE lifetime (se configurato)
         if paid_ads_max_total_budget > 0:
-            budget_remaining = paid_ads_max_total_budget - cumulative_paid_ads_spend
-            budget_this_month = min(paid_ads_monthly_budget, max(0, budget_remaining))
-        else:
-            budget_this_month = paid_ads_monthly_budget
+            total_remaining = paid_ads_max_total_budget - cumulative_paid_ads_spend
+            budget_this_month = min(budget_this_month, max(0, total_remaining))
         
-        # STOP ADS SE MERCATO FOLLOWER SATURO
-        # Se saturation_factor < 5% (mercato quasi saturo), non ha senso spendere per acquisire follower
-        # perché la crescita organica + paid non porterà nuovi follower significativi
-        market_saturated = saturation_factor < 0.05
+        # STOP ADS SE MERCATO (corrente) È SATURO
+        # Se ads_saturation_factor < 5%, non ha senso spendere per acquisire follower
+        ads_market_saturated = ads_saturation_factor < 0.05
         
-        if market_saturated:
+        if ads_market_saturated:
             # MERCATO SATURO: ferma tutte le campagne paid ads
             follower_ads_spend = 0.0
             click_ads_spend = 0.0
@@ -479,14 +583,17 @@ def recalc_model(assumptions_df: pd.DataFrame,
             paid_follower_ads_visitors = 0.0
             paid_click_ads_visitors = 0.0
         
-        # Aggiorna spesa cumulativa
-        cumulative_paid_ads_spend += (follower_ads_spend + click_ads_spend)
+        # Aggiorna spesa cumulativa (totale e annuale)
+        month_ads_spend = follower_ads_spend + click_ads_spend
+        cumulative_paid_ads_spend += month_ads_spend
+        annual_paid_ads_spend += month_ads_spend
         
         # Follower end = start + crescita organica (logistica) + paid followers
         followers_end = followers_start + organic_follower_growth + paid_follower_ads_new_followers
         
-        # CAP: non superare mai il tetto di mercato (safety contro errori numerici)
-        followers_end = min(followers_end, market_max_followers)
+        # CAP: non superare mai il tetto di mercato corrente (LOCAL o GLOBAL)
+        current_market_cap = market_max_followers_global if is_in_global_phase else market_max_followers_local
+        followers_end = min(followers_end, current_market_cap)
         
         # Posts per month (same for all years now)
         posts = posts_per_month
@@ -521,24 +628,45 @@ def recalc_model(assumptions_df: pd.DataFrame,
             org_signups = signups_total * (org_visitors / visitors_total)
             inf_signups = signups_total * (inf_visitors / visitors_total)
             other_signups = signups_total * (other_visitors / visitors_total)
+            paid_ads_signups = signups_total * (paid_ads_visitors / visitors_total)  # NEW: signup da paid ads
         else:
-            org_signups = inf_signups = other_signups = 0
+            org_signups = inf_signups = other_signups = paid_ads_signups = 0
         
-        # Referral new payers (from existing user base)
+        # ===== REFERRAL - NUOVA LOGICA (v7.3) =====
+        # Regole:
+        # 1. Ogni NUOVO utente registrato (Signups) ha probabilità referral_rate di invitare 1 amico
+        #    → applicata UNA SOLA VOLTA per utente (alla coorte del mese di registrazione)
+        # 2. La saturazione di mercato frena i referral quando ci si avvicina al tetto
+        #
+        # Formula: Referral_New_Payers = Signups × referral_rate × referral_capacity
+        #
+        # PRIMA (vecchia logica): Referral_New_Payers = Paying_Users_Start × referral_rate
+        #   → Problema: ricalcolava la probabilità ogni mese sugli stessi utenti
+        
         if i == 0:
             paying_start = 0
         else:
             paying_start = monthly_data[i-1]['Paying_Users_End']
         
-        referral_new_payers = paying_start * referral_rate
+        # Tetto paying users corrente (LOCAL o GLOBAL)
+        current_paying_cap = market_max_paying_global if is_in_global_phase else market_max_paying_local
+        
+        # Fattore di saturazione: quando il mercato è quasi pieno, i referral si spengono
+        # referral_capacity ∈ [0, 1]: 1 = mercato vuoto, 0 = mercato pieno
+        referral_capacity = max(0.0, 1.0 - paying_start / current_paying_cap) if current_paying_cap > 0 else 0.0
+        
+        # Utenti "potenziali inviter": nuovi registrati del mese × probabilità di invitare
+        # Nota: referral_rate è ora la probabilità lifetime che un nuovo utente inviti un amico
+        potential_referral_inviters = signups_total * referral_rate
+        
+        # Nuovi paying da referral = potenziali inviter × capacità di mercato residua
+        referral_new_payers = potential_referral_inviters * referral_capacity
         
         # Channel-specific new payers
         org_new_payers = org_signups * conv_sp
         inf_new_payers = inf_signups * conv_sp
         other_new_payers = other_signups * conv_sp
-        
-        # Total new paying users
-        new_paying = org_new_payers + inf_new_payers + other_new_payers + referral_new_payers
+        paid_ads_new_payers = paid_ads_signups * conv_sp  # NEW: paying users da paid ads
         
         # Churn (cycle through Y1/Y2/Y3 rates)
         year_mod = ((year - 1) % 3) + 1  # Cycles 1,2,3,1,2,3...
@@ -549,13 +677,60 @@ def recalc_model(assumptions_df: pd.DataFrame,
         else:
             churn_rate = churn_y3
         
-        # User cohort dynamics
+        # User cohort dynamics - la parte di paying_end viene calcolata DOPO free users tracking
         churned = paying_start * churn_rate
-        paying_end = paying_start - churned + new_paying
         
-        # CAP: non superare mai il tetto di mercato per paying users
-        # (coerente con il modello ad S per i follower)
-        paying_end = min(paying_end, market_max_paying)
+        # ===== FREE USERS TRACKING =====
+        # Free users = utenti registrati che non pagano (ancora)
+        # Signups cumulativi - Paying users = Free users
+        if i == 0:
+            cumulative_signups = signups_total
+            free_users_start = 0
+        else:
+            cumulative_signups = monthly_data[i-1]['Cumulative_Signups'] + signups_total
+            free_users_start = monthly_data[i-1]['Free_Users_End']
+        
+        # ===== CONVERSIONE DA FREE ESISTENTI A PAID (v7.4) =====
+        # Logica: ogni mese, una percentuale degli utenti free ATTIVI converte a paid
+        # Questo è ADDIZIONALE rispetto alla conversione immediata dei nuovi signup
+        #
+        # 1. Free users attivi = Free_Users_Start × Free_Active_Share
+        # 2. Nuovi paid da free esistenti = Free_Active × Existing_Free_to_Paid_Monthly_Conv_Rate
+        #
+        # Esempio: 1000 free users, 50% attivi = 500 attivi
+        #          500 × 0.75% = 3.75 → ~4 nuovi paying al mese da free esistenti
+        
+        free_active_users = free_users_start * free_active_share
+        new_payers_from_existing_free = max(0, round(free_active_users * existing_free_to_paid_rate))
+        
+        # ===== COMPONENTI NUOVI PAGANTI SEPARATI =====
+        # 1. Nuovi paganti da NUOVI signup (conversione immediata)
+        new_payers_from_new_signups = org_new_payers + inf_new_payers + other_new_payers + paid_ads_new_payers
+        
+        # 2. Nuovi paganti da FREE ESISTENTI (conversione ritardata)
+        # Già calcolato sopra: new_payers_from_existing_free
+        
+        # 3. Nuovi paganti da REFERRAL (già calcolato)
+        new_payers_from_referral = referral_new_payers
+        
+        # TOTALE nuovi paying users del mese
+        new_paying_total = new_payers_from_new_signups + new_payers_from_existing_free + new_payers_from_referral
+        
+        # Free users end = free users start + nuovi signups che NON convertono - free esistenti che convertono
+        # - nuovi free = signups - nuovi paying da signups (quelli che convertono subito)
+        # - sottrarre anche i free esistenti che convertono questo mese
+        new_free_users = signups_total - new_payers_from_new_signups
+        free_users_end = max(0, free_users_start + new_free_users - new_payers_from_existing_free)
+        
+        # ===== PAYING USERS END (aggiornato con new_paying_total) =====
+        # Ora include anche i paganti da free esistenti
+        paying_end = max(0, paying_start - churned + new_paying_total)
+        
+        # CAP: non superare mai il tetto di mercato per paying users (LOCAL o GLOBAL)
+        paying_end = min(paying_end, current_paying_cap)
+        
+        # Total users = paying + free
+        total_users_end = paying_end + free_users_end
         
         # Revenue
         mrr = paying_end * arpu
@@ -572,6 +747,10 @@ def recalc_model(assumptions_df: pd.DataFrame,
         datasub_cost = datasub_fee if mrr >= datasub_threshold else 0
         xapi_cost = xapi_fee if mrr >= xapi_threshold else 0
         
+        # Fixed costs con crescita annuale
+        # Anno 1: base_fixed_cost, Anno 2: base × (1+growth), Anno 3: base × (1+growth)^2, ...
+        current_fixed_cost = base_fixed_cost * ((1 + fixed_cost_annual_growth) ** (year - 1))
+        
         # ===== GROSS MARGIN DINAMICO (PARTE A) =====
         # Direct costs = costi variabili direttamente legati al servizio SaaS
         direct_costs = datasub_cost + xapi_cost
@@ -583,7 +762,7 @@ def recalc_model(assumptions_df: pd.DataFrame,
         gross_margin_month = (gross_profit / mrr) if mrr > 0 else 0.0
         
         # Total costs (include marketing + direct costs + fixed costs)
-        total_costs = total_marketing + direct_costs + base_fixed_cost
+        total_costs = total_marketing + direct_costs + current_fixed_cost
         
         # Cash flow
         net_cash_flow = mrr - total_costs
@@ -592,12 +771,39 @@ def recalc_model(assumptions_df: pd.DataFrame,
         else:
             cumulative_cash = monthly_data[i-1]['Cumulative_Cash'] + net_cash_flow
         
+        # ===== CAC e LTV MENSILE (per grafici) =====
+        # Aggiorna cumulativi
+        cumulative_marketing_spend += total_marketing
+        cumulative_new_customers += new_paying_total
+        
+        # CAC cumulativo = totale speso / totale nuovi clienti
+        cumulative_cac = cumulative_marketing_spend / cumulative_new_customers if cumulative_new_customers > 0 else 0
+        
+        # CAC mensile = spesa marketing del mese / nuovi clienti del mese
+        monthly_cac = total_marketing / new_paying_total if new_paying_total > 0 else 0
+        
+        # LTV = ARPU × Gross Margin / Churn (con gross margin mensile)
+        # Se churn è 0, assumiamo cliente infinito ma cappato
+        monthly_ltv = (arpu * gross_margin_month / churn_rate) if churn_rate > 0 else (arpu * gross_margin_month * 120)  # Cap a 10 anni
+        
+        # LTV/CAC ratio
+        ltv_cac_ratio = monthly_ltv / cumulative_cac if cumulative_cac > 0 else 0
+        
         # Store month data (includes all new Paid Ads and Gross Margin columns)
+        # Calcola la saturazione rispetto al mercato CORRENTE (local o global)
+        current_market_max_for_display = market_max_followers_global if is_in_global_phase else market_max_followers_local
+        current_saturation_pct = (followers_start / current_market_max_for_display) * 100
+        
         monthly_data.append({
             'Year': year,
             'Month': month,
             'Followers_Start': followers_start,
             'Followers_End': followers_end,
+            # === MARKET PHASE TRACKING (LOCAL → GLOBAL) ===
+            'Market_Phase': 'Global' if is_in_global_phase else 'Local',
+            'Market_Saturation_Pct': current_saturation_pct,  # % del mercato CORRENTE (local o global) raggiunto
+            'Ads_Saturation_Factor': ads_saturation_factor,  # Fattore saturazione per gli ads
+            # ===========================
             'Posts': posts,
             'Impr_Followers': impr_followers,
             'Impr_NonFollowers': impr_non_followers,
@@ -609,7 +815,8 @@ def recalc_model(assumptions_df: pd.DataFrame,
             # === PAID ADS COLUMNS ===
             'FollowerAds_Spend': follower_ads_spend,
             'ClickAds_Spend': click_ads_spend,
-            'Cumulative_PaidAds_Spend': cumulative_paid_ads_spend,  # Budget speso cumulativo
+            'Annual_PaidAds_Spend': annual_paid_ads_spend,  # Budget speso nell'anno corrente
+            'Cumulative_PaidAds_Spend': cumulative_paid_ads_spend,  # Budget speso cumulativo (lifetime)
             'Paid_FollowerAds_Impressions': paid_follower_ads_impressions,
             'Paid_FollowerAds_Reach': paid_follower_ads_reach,
             'Paid_FollowerAds_NewFollowers': paid_follower_ads_new_followers,
@@ -622,15 +829,29 @@ def recalc_model(assumptions_df: pd.DataFrame,
             'Org_Signups': org_signups,
             'Inf_Signups': inf_signups,
             'Other_Signups': other_signups,
-            'Referral_New_Payers': referral_new_payers,
+            'PaidAds_Signups': paid_ads_signups,  # NEW: signup da paid ads
+            # === NEW PAYERS BREAKDOWN (v7.4) ===
+            'New_Payers_from_New_Signups': new_payers_from_new_signups,  # Conversione immediata da nuovi signup
+            'New_Payers_from_Existing_Free': new_payers_from_existing_free,  # Conversione ritardata da free esistenti
+            'New_Payers_from_Referral': new_payers_from_referral,  # Da referral
+            'Referral_New_Payers': referral_new_payers,  # Legacy column (same as New_Payers_from_Referral)
+            # ===========================
             'Org_New_Payers': org_new_payers,
             'Inf_New_Payers': inf_new_payers,
             'Other_New_Payers': other_new_payers,
-            'New_Paying_Users': new_paying,
+            'PaidAds_New_Payers': paid_ads_new_payers,  # NEW: paying users da paid ads
+            'New_Paying_Users': new_paying_total,  # UPDATED: ora include anche free esistenti convertiti
             'Churn_Rate': churn_rate,
             'Paying_Users_Start': paying_start,
             'Churned_Users': churned,
             'Paying_Users_End': paying_end,
+            # === FREE USERS COLUMNS (v7.4) ===
+            'Cumulative_Signups': cumulative_signups,
+            'Free_Users_Start': free_users_start,
+            'Free_Active_Users': free_active_users,  # NEW: free users attivi (50% default)
+            'Free_Users_End': free_users_end,
+            'Total_Users_End': total_users_end,
+            # ===========================
             'ARPU': arpu,
             'MRR': mrr,
             'Org_Marketing_Spend': org_marketing,
@@ -646,10 +867,15 @@ def recalc_model(assumptions_df: pd.DataFrame,
             # ===========================
             'DataSub_Cost': datasub_cost,
             'XAPI_Cost': xapi_cost,
-            'Base_Fixed_Cost': base_fixed_cost,
+            'Base_Fixed_Cost': current_fixed_cost,  # Con crescita annuale applicata
             'Total_Costs': total_costs,
             'Net_Cash_Flow': net_cash_flow,
-            'Cumulative_Cash': cumulative_cash
+            'Cumulative_Cash': cumulative_cash,
+            # === CAC e LTV MENSILE ===
+            'Monthly_CAC': monthly_cac,
+            'Cumulative_CAC': cumulative_cac,
+            'Monthly_LTV': monthly_ltv,
+            'LTV_CAC_Ratio': ltv_cac_ratio
         })
     
     monthly = pd.DataFrame(monthly_data)
@@ -721,9 +947,15 @@ def recalc_model(assumptions_df: pd.DataFrame,
             'End_MRR_EUR': end_mrr,
             'ARR_EUR': arr,
             'Total_New_Customers': total_new,
+            # === NEW PAYERS BREAKDOWN (v7.4) ===
+            'New_Payers_from_New_Signups': year_rows['New_Payers_from_New_Signups'].sum(),
+            'New_Payers_from_Existing_Free': year_rows['New_Payers_from_Existing_Free'].sum(),
+            'New_Payers_from_Referral': year_rows['New_Payers_from_Referral'].sum(),
+            # ===========================
             'Org_New_Payers': year_rows['Org_New_Payers'].sum(),
             'Inf_New_Payers': year_rows['Inf_New_Payers'].sum(),
             'Other_New_Payers': year_rows['Other_New_Payers'].sum(),
+            'PaidAds_New_Payers': year_rows['PaidAds_New_Payers'].sum(),  # NEW: paying users da paid ads
             'Referral_New_Payers': year_rows['Referral_New_Payers'].sum(),
             'Org_Marketing_Spend_EUR': total_org_spend,
             'Inf_Marketing_Spend_EUR': total_inf_spend,
@@ -876,7 +1108,10 @@ class DataTableWidget(QWidget):
         # Monthly Model Formulas
         monthly_formulas = {
             'Followers_Start': 'Previous month Followers_End (or Followers_0 for first month)',
-            'Followers_End': 'Followers_Start × (1 + Follower_Monthly_Growth) + Paid_FollowerAds_NewFollowers',
+            'Followers_End': 'Followers_Start + Organic_Growth + Paid_FollowerAds_NewFollowers (capped at Market_Max)',
+            'Market_Phase': 'Local se Followers < 95% Market_Max_Local, altrimenti Global',
+            'Market_Saturation_Pct': '(Followers_Start / Current_Market_Max) × 100 - usa Market_Max_Local in fase Local, Market_Max_Global in fase Global',
+            'Ads_Saturation_Factor': '1 - (Followers / Current_Market_Max) - usato per decidere se gli ads sono ancora efficaci',
             'Posts': 'Posts_per_Month_Y1/Y2/Y3 (based on current year)',
             'Impr_Followers': '((Followers_Start + Followers_End) / 2) × Posts × Reach_per_Post × Frequency_Impressions_per_User',
             'Impr_NonFollowers': 'Impr_Followers × NonFollower_Reach_Multiplier',
@@ -884,30 +1119,42 @@ class DataTableWidget(QWidget):
             'NewUnique_NonFollowers': 'Impr_NonFollowers / Frequency_Impressions_per_User',
             'Org_Visitors': 'NewUnique_NonFollowers × Organic_CTR_to_Site',
             'Inf_Visitors': 'Inf_Collabs × (Inf_Avg_Followers × Inf_Reach_Rate × Inf_Click_Rate) - FIX 1: calculated dynamically',
-            'Other_Visitors': 'Other_Marketing_Budget_Y1/Y2/Y3 / 2.0 (assumed $2 CPC)',
+            'Other_Visitors': 'Other_Marketing_Budget / 2.0 (assumed $2 CPC)',
             'Visitors_Total': 'Org_Visitors + Inf_Visitors + Other_Visitors + PaidAds_Visitors',
             'Signups': 'Visitors_Total × ConvVS',
             'Org_Signups': 'Signups × (Org_Visitors / Visitors_Total)',
             'Inf_Signups': 'Signups × (Inf_Visitors / Visitors_Total)',
             'Other_Signups': 'Signups × (Other_Visitors / Visitors_Total)',
-            'Referral_New_Payers': 'Paying_Users_Start × Referral_Monthly_Rate',
+            'PaidAds_Signups': 'Signups × (PaidAds_Visitors / Visitors_Total) - NEW: signups da paid ads',
+            # === NEW PAYERS BREAKDOWN (v7.4) ===
+            'New_Payers_from_New_Signups': 'Org_New_Payers + Inf_New_Payers + Other_New_Payers + PaidAds_New_Payers - conversione immediata da nuovi signup',
+            'New_Payers_from_Existing_Free': 'Free_Active_Users × Existing_Free_to_Paid_Monthly_Conv_Rate - conversione ritardata da free esistenti (0.75% default)',
+            'New_Payers_from_Referral': 'Signups × Referral_Rate × (1 - Paying_Start/Market_Max) - nuovi paganti da referral',
+            'Referral_New_Payers': 'Legacy column, same as New_Payers_from_Referral',
             'Org_New_Payers': 'Org_Signups × ConvSP',
             'Inf_New_Payers': 'Inf_Signups × ConvSP',
             'Other_New_Payers': 'Other_Signups × ConvSP',
-            'New_Paying_Users': 'Org_New_Payers + Inf_New_Payers + Other_New_Payers + Referral_New_Payers',
-            'Churn_Rate': 'ChurnY1/Y2/Y3 (based on current year)',
+            'PaidAds_New_Payers': 'PaidAds_Signups × ConvSP - NEW: paying users da paid ads',
+            'New_Paying_Users': 'New_Payers_from_New_Signups + New_Payers_from_Existing_Free + New_Payers_from_Referral (v7.4: include free esistenti)',
+            'Churn_Rate': 'Churn_Rate parameter (unified for all years)',
             'Paying_Users_Start': 'Previous month Paying_Users_End (or 0 for first month)',
             'Churned_Users': 'Paying_Users_Start × Churn_Rate',
-            'Paying_Users_End': 'Paying_Users_Start - Churned_Users + New_Paying_Users',
+            'Paying_Users_End': 'max(0, Paying_Users_Start - Churned_Users + New_Paying_Users) capped at Market_Max',
+            'Cumulative_Signups': 'Somma cumulativa di tutti i Signups da inizio simulazione',
+            'Free_Users_Start': 'Previous month Free_Users_End (or 0 for first month)',
+            'Free_Active_Users': 'Free_Users_Start × Free_Active_Share (default 50%) - utenti free considerati attivi',
+            'Free_Users_End': 'max(0, Free_Users_Start + Signups - New_Payers_from_New_Signups - New_Payers_from_Existing_Free)',
+            'Total_Users_End': 'Paying_Users_End + Free_Users_End - totale utenti registrati',
             'ARPU': 'ARPU parameter from assumptions',
             'MRR': 'Paying_Users_End × ARPU',
             'Org_Marketing_Spend': 'Posts × Org_Cost_per_Post',
             'Inf_Marketing_Spend': 'Inf_New_Payers × Influencer_Reward_per_Sub',
-            'Other_Marketing_Spend': 'Other_Marketing_Budget_Y1/Y2/Y3 (based on year)',
+            'Other_Marketing_Spend': 'Other_Marketing_Budget (unified for all years)',
             'Referral_Marketing_Spend': 'Referral_New_Payers × Referral_Reward_per_Sub',
-            'FollowerAds_Spend': 'PaidAds_Monthly_Budget se Followers_Start < soglia, else 0 (FASE 1: Follower Acquisition). Stop quando raggiunto PaidAds_Max_Total_Budget',
-            'ClickAds_Spend': 'PaidAds_Monthly_Budget se Followers_Start ≥ soglia, else 0 (FASE 2: Visitor Generation). Stop quando raggiunto PaidAds_Max_Total_Budget',
-            'Cumulative_PaidAds_Spend': 'Somma cumulativa di FollowerAds_Spend + ClickAds_Spend da inizio simulazione. Quando raggiunge PaidAds_Max_Total_Budget, le campagne si fermano.',
+            'FollowerAds_Spend': 'min(PaidAds_Monthly_Budget, Annual_Remaining, Total_Remaining) se Fase 1. Stop se raggiunto limite annuale o totale.',
+            'ClickAds_Spend': 'min(PaidAds_Monthly_Budget, Annual_Remaining, Total_Remaining) se Fase 2. Stop se raggiunto limite annuale o totale.',
+            'Annual_PaidAds_Spend': 'Somma spesa ads nell\'anno corrente. Si resetta a 0 ogni nuovo anno. Limite: PaidAds_Max_Annual_Budget.',
+            'Cumulative_PaidAds_Spend': 'Somma cumulativa lifetime di tutti gli ads. Limite: PaidAds_Max_Total_Budget.',
             'Paid_FollowerAds_Impressions': '(FollowerAds_Spend / FollowerAds_CPM_EUR) × 1000',
             'Paid_FollowerAds_Reach': 'Paid_FollowerAds_Impressions / Frequency_Impressions_per_User',
             'Paid_FollowerAds_NewFollowers': 'Paid_FollowerAds_Reach × FollowerAds_Reach_to_Follower_Rate',
@@ -921,7 +1168,7 @@ class DataTableWidget(QWidget):
             'Direct_Costs': 'DataSub_Cost + XAPI_Cost (variable costs that scale with usage)',
             'Gross_Profit': 'MRR - Direct_Costs (revenue minus variable costs)',
             'Gross_Margin_Month': 'IF(MRR > 0, Gross_Profit / MRR, 0) - monthly gross margin percentage',
-            'Base_Fixed_Cost': 'BaseFixedCost parameter from assumptions',
+            'Base_Fixed_Cost': 'BaseFixedCost × (1 + FixedCost_Annual_Growth)^(Year-1) - costi fissi con crescita annuale',
             'Total_Costs': 'Total_Marketing_Spend + DataSub_Cost + XAPI_Cost + Base_Fixed_Cost',
             'Net_Cash_Flow': 'MRR - Total_Costs',
             'Cumulative_Cash': 'Previous month Cumulative_Cash + Net_Cash_Flow (or Net_Cash_Flow for first month)',
@@ -937,7 +1184,12 @@ class DataTableWidget(QWidget):
             'Org_New_Payers': 'SUM(Org_New_Payers) for all months in year',
             'Inf_New_Payers': 'SUM(Inf_New_Payers) for all months in year',
             'Other_New_Payers': 'SUM(Other_New_Payers) for all months in year',
+            'PaidAds_New_Payers': 'SUM(PaidAds_New_Payers) for all months in year - NEW: paying users da paid ads',
             'Referral_New_Payers': 'SUM(Referral_New_Payers) for all months in year',
+            # === NEW PAYERS BREAKDOWN (v7.4) ===
+            'New_Payers_from_New_Signups': 'SUM(New_Payers_from_New_Signups) for all months in year',
+            'New_Payers_from_Existing_Free': 'SUM(New_Payers_from_Existing_Free) for all months in year - conversione da free esistenti',
+            'New_Payers_from_Referral': 'SUM(New_Payers_from_Referral) for all months in year',
             'Org_Marketing_Spend_EUR': 'SUM(Org_Marketing_Spend) for all months in year',
             'Inf_Marketing_Spend_EUR': 'SUM(Inf_Marketing_Spend) for all months in year',
             'Other_Marketing_Spend_EUR': 'SUM(Other_Marketing_Spend) for all months in year',
@@ -948,7 +1200,7 @@ class DataTableWidget(QWidget):
             'Revenue_Year': 'SUM(MRR) for all months in year',
             'Gross_Profit_Year': 'SUM(Gross_Profit) for all months in year',
             'Gross_Margin_Year': 'IF(Revenue_Year > 0, Gross_Profit_Year / Revenue_Year, 0) - yearly gross margin percentage',
-            'Assumed_Monthly_Churn': 'ChurnY1/Y2/Y3 (based on current year)',
+            'Assumed_Monthly_Churn': 'Churn_Rate parameter (unified for all years)',
             'LTV_EUR': '(ARPU × Gross_Margin_Year) / Assumed_Monthly_Churn - uses DYNAMIC Gross Margin from actual results',
             'LTV_CAC_Ratio': 'LTV_EUR / Average_CAC_EUR',
             'Cumulative_Cash_EndOfYear': 'Last month of year: Cumulative_Cash',
@@ -1000,13 +1252,32 @@ class DataTableWidget(QWidget):
             for j, col in enumerate(df.columns):
                 value = df.iloc[i, j]
                 
+                # Colonne che devono mantenere i decimali anche nelle tabelle Monthly/Yearly
+                # (ratios, percentuali, metriche unitarie)
+                decimal_columns = {
+                    'Churn_Rate', 'Churn', 'ChurnY1', 'ChurnY2', 'ChurnY3',
+                    'ARPU', 'ConvVS', 'ConvSP',
+                    'Gross_Margin_Month', 'Gross_Margin_Year',
+                    'Follower_Monthly_Growth', 'Follower_Growth_Effective',
+                    'CAC', 'LTV_EUR', 'LTV_CAC_Ratio',
+                    'FollowerAds_CPM_EUR', 'ClickAds_CPC_EUR',
+                    'Referral_Monthly_Rate', 'referral_capacity'
+                }
+                
                 # Format value
                 if isinstance(value, (int, float)):
-                    if format_as_integer:
-                        # Format as integer for Monthly/Yearly tables
+                    if format_as_integer and col not in decimal_columns:
+                        # Format as integer for Monthly/Yearly tables (non-ratio columns)
                         text = f"{int(round(value)):,}"
+                    elif col in decimal_columns or not format_as_integer:
+                        # Format with decimals for ratio/percentage columns or Assumptions
+                        if abs(value) < 1 and value != 0:
+                            # Small decimals (ratios): show 4 decimal places
+                            text = f"{value:.4f}"
+                        else:
+                            # Larger numbers: show 2 decimal places
+                            text = f"{value:.2f}"
                     else:
-                        # Format with 2 decimal places for Assumptions
                         text = f"{value:.2f}"
                 else:
                     text = str(value)
@@ -1076,7 +1347,7 @@ class DataTableWidget(QWidget):
 
 
 class ChartsWidget(QWidget):
-    """Widget to display interactive matplotlib charts with scroll support."""
+    """Widget to display interactive matplotlib charts with scroll and hover support."""
     
     def __init__(self):
         super().__init__()
@@ -1087,43 +1358,123 @@ class ChartsWidget(QWidget):
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Create scroll area
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Create scroll area with mouse wheel support
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         
         # Container widget for scroll area
         container = QWidget()
         container_layout = QVBoxLayout()
         
-        # Create matplotlib figure - dimensioni ragionevoli
-        self.figure = Figure(figsize=(12, 14), dpi=80)
+        # Create matplotlib figure - dimensioni ragionevoli (aumentata altezza per 8 grafici)
+        self.figure = Figure(figsize=(12, 18), dpi=80)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumSize(900, 1000)
+        self.canvas.setMinimumSize(900, 1300)
         
         # Add navigation toolbar for zoom/pan
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        
+        # Tooltip annotation (will be created per-axis in update_charts)
+        self.annot = None
+        self.monthly_df = None
         
         container_layout.addWidget(self.toolbar)
         container_layout.addWidget(self.canvas)
         container.setLayout(container_layout)
         
-        scroll_area.setWidget(container)
-        main_layout.addWidget(scroll_area)
+        self.scroll_area.setWidget(container)
+        main_layout.addWidget(self.scroll_area)
         self.setLayout(main_layout)
+        
+        # Connect mouse motion event for hover tooltips
+        self.canvas.mpl_connect('motion_notify_event', self.on_hover)
+    
+    def on_hover(self, event):
+        """Show tooltip with values when hovering over charts."""
+        if event.inaxes is None or self.monthly_df is None:
+            return
+        
+        ax = event.inaxes
+        x = event.xdata
+        
+        if x is None:
+            return
+        
+        # Get month index (1-based)
+        month_idx = int(round(x))
+        if month_idx < 1 or month_idx > len(self.monthly_df):
+            return
+        
+        # Get data for this month
+        row = self.monthly_df.iloc[month_idx - 1]
+        
+        # Build tooltip text based on which chart we're in
+        title = ax.get_title()
+        tooltip_lines = [f"Month {month_idx}"]
+        
+        if 'MRR' in title:
+            tooltip_lines.append(f"MRR: €{row['MRR']:,.0f}")
+        elif 'Paying Users' in title or 'Followers' in title:
+            tooltip_lines.append(f"Paying Users: {row['Paying_Users_End']:,.0f}")
+            tooltip_lines.append(f"Followers: {row['Followers_End']:,.0f}")
+        elif 'Cumulative Cash' in title:
+            tooltip_lines.append(f"Cash: €{row['Cumulative_Cash']:,.0f}")
+        elif 'Marketing Spend' in title:
+            tooltip_lines.append(f"Organic: €{row['Org_Marketing_Spend']:,.0f}")
+            tooltip_lines.append(f"Paid Ads: €{row['PaidAds_Marketing_Spend']:,.0f}")
+            tooltip_lines.append(f"Referral: €{row['Referral_Marketing_Spend']:,.0f}")
+        elif 'Funnel' in title:
+            tooltip_lines.append(f"Visitors: {row['Visitors_Total']:,.0f}")
+            tooltip_lines.append(f"Signups: {row['Signups']:,.0f}")
+            tooltip_lines.append(f"New Paying: {row['New_Paying_Users']:,.0f}")
+        elif 'Unit Economics' in title or 'Gross Margin' in title:
+            tooltip_lines.append(f"Gross Margin: {row['Gross_Margin_Month']*100:.1f}%")
+            tooltip_lines.append(f"Net Cash Flow: €{row['Net_Cash_Flow']:,.0f}")
+        elif 'Breakeven' in title or 'Expenses' in title:
+            tooltip_lines.append(f"MRR: €{row['MRR']:,.0f}")
+            tooltip_lines.append(f"Total Costs: €{row['Total_Costs']:,.0f}")
+            diff = row['MRR'] - row['Total_Costs']
+            tooltip_lines.append(f"Profit/Loss: €{diff:,.0f}")
+        elif 'Users Breakdown' in title or 'Paying vs Free' in title:
+            if 'Free_Users_End' in row:
+                tooltip_lines.append(f"Paying Users: {row['Paying_Users_End']:,.0f}")
+                tooltip_lines.append(f"Free Users: {row['Free_Users_End']:,.0f}")
+                tooltip_lines.append(f"Total Users: {row['Total_Users_End']:,.0f}")
+        
+        tooltip_text = "\\n".join(tooltip_lines)
+        
+        # Update status bar with tooltip (simpler than annotation)
+        self.setToolTip(tooltip_text.replace("\\n", "\n"))
+    
+    def wheelEvent(self, event):
+        """Handle mouse wheel for scrolling."""
+        # Get scroll delta
+        delta = event.angleDelta().y()
+        
+        # Scroll the scroll area
+        scrollbar = self.scroll_area.verticalScrollBar()
+        scrollbar.setValue(scrollbar.value() - delta)
+        
+        event.accept()
     
     def update_charts(self, monthly_df: pd.DataFrame):
-        """Update all charts with new data (no hover for performance)."""
+        """Update all charts with new data and hover support."""
+        self.monthly_df = monthly_df  # Store for hover tooltips
         self.figure.clear()
         
-        # Create 6 subplots (3 righe x 2 colonne)
-        ax1 = self.figure.add_subplot(3, 2, 1)
-        ax2 = self.figure.add_subplot(3, 2, 2)
-        ax3 = self.figure.add_subplot(3, 2, 3)
-        ax4 = self.figure.add_subplot(3, 2, 4)
-        ax5 = self.figure.add_subplot(3, 2, 5)
-        ax6 = self.figure.add_subplot(3, 2, 6)
+        # Create 9 subplots (5 righe x 2 colonne, ultimo slot vuoto)
+        ax1 = self.figure.add_subplot(5, 2, 1)
+        ax2 = self.figure.add_subplot(5, 2, 2)
+        ax3 = self.figure.add_subplot(5, 2, 3)
+        ax4 = self.figure.add_subplot(5, 2, 4)
+        ax5 = self.figure.add_subplot(5, 2, 5)
+        ax6 = self.figure.add_subplot(5, 2, 6)
+        ax7 = self.figure.add_subplot(5, 2, 7)
+        ax8 = self.figure.add_subplot(5, 2, 8)
+        ax9 = self.figure.add_subplot(5, 2, 9)
+        ax10 = self.figure.add_subplot(5, 2, 10)
         
         # Create month index
         month_index = list(range(1, len(monthly_df) + 1))
@@ -1136,6 +1487,24 @@ class ChartsWidget(QWidget):
         ax1.grid(True, alpha=0.3)
         ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'€{x:,.0f}'))
         ax1.tick_params(axis='both', labelsize=7)
+        
+        # Linea verticale quando ARR raggiunge €1M (MRR >= 83,333)
+        arr_target = 1_000_000  # €1M ARR
+        mrr_target = arr_target / 12  # ~€83,333 MRR
+        mrr_values = monthly_df['MRR'].values
+        arr_1m_month = None
+        for idx, mrr_val in enumerate(mrr_values):
+            if mrr_val >= mrr_target:
+                arr_1m_month = idx + 1  # Month index (1-based)
+                break
+        
+        if arr_1m_month is not None:
+            ax1.axvline(x=arr_1m_month, color='#ffd166', linestyle='--', linewidth=2, alpha=0.8)
+            ax1.annotate(f'€1M ARR\n(Month {arr_1m_month})', 
+                        xy=(arr_1m_month, mrr_values[arr_1m_month-1]), 
+                        xytext=(arr_1m_month + 2, mrr_values[arr_1m_month-1] * 0.7),
+                        fontsize=7, color='#e67e22', fontweight='bold',
+                        arrowprops=dict(arrowstyle='->', color='#e67e22', lw=1))
         
         # ===== Chart 2: Paying Users & Followers =====
         ax2.plot(month_index, monthly_df['Paying_Users_End'], linewidth=2, color='#06d6a0', label='Paying Users')
@@ -1235,6 +1604,132 @@ class ChartsWidget(QWidget):
         legend_elements6 = [Line2D([0], [0], color='#16a085', lw=2, label='Gross Margin %'),
                            Line2D([0], [0], color='#c0392b', lw=2, label='Net Cash Flow')]
         ax6.legend(handles=legend_elements6, loc='lower right', fontsize=7)
+        
+        # ===== Chart 7: MRR vs Total Expenses (Breakeven) =====
+        mrr_values_ch7 = monthly_df['MRR'].values
+        expenses_values = monthly_df['Total_Costs'].values
+        
+        ax7.plot(month_index, mrr_values_ch7, linewidth=2, color='#2E86AB', label='MRR (Revenue)')
+        ax7.plot(month_index, expenses_values, linewidth=2, color='#e63946', label='Total Costs')
+        
+        # Green fill where MRR > Expenses (profit zone)
+        ax7.fill_between(month_index, mrr_values_ch7, expenses_values,
+                        where=[m > e for m, e in zip(mrr_values_ch7, expenses_values)],
+                        alpha=0.3, color='green', interpolate=True, label='Profit Zone')
+        
+        # Red fill where MRR <= Expenses (loss zone)
+        ax7.fill_between(month_index, mrr_values_ch7, expenses_values,
+                        where=[m <= e for m, e in zip(mrr_values_ch7, expenses_values)],
+                        alpha=0.3, color='red', interpolate=True, label='Loss Zone')
+        
+        # Linea verticale quando ARR raggiunge €1M
+        if arr_1m_month is not None:
+            ax7.axvline(x=arr_1m_month, color='#ffd166', linestyle='--', linewidth=2, alpha=0.8)
+            ax7.annotate(f'€1M ARR', 
+                        xy=(arr_1m_month, mrr_values_ch7[arr_1m_month-1]), 
+                        xytext=(arr_1m_month + 2, max(mrr_values_ch7) * 0.5),
+                        fontsize=7, color='#e67e22', fontweight='bold',
+                        arrowprops=dict(arrowstyle='->', color='#e67e22', lw=1))
+        
+        ax7.set_title('Revenue vs Expenses (Breakeven)', fontweight='bold', fontsize=10)
+        ax7.set_xlabel('Month', fontsize=8)
+        ax7.set_ylabel('EUR', fontsize=8)
+        ax7.grid(True, alpha=0.3)
+        ax7.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'€{x:,.0f}'))
+        ax7.legend(fontsize=7, loc='upper left')
+        ax7.tick_params(axis='both', labelsize=7)
+        
+        # ===== Chart 8: Users Breakdown (Paying vs Free vs Total) =====
+        # Check if Free_Users_End column exists (new feature)
+        if 'Free_Users_End' in monthly_df.columns:
+            paying_users = monthly_df['Paying_Users_End'].values
+            free_users = monthly_df['Free_Users_End'].values
+            total_users = monthly_df['Total_Users_End'].values
+            
+            ax8.stackplot(month_index, paying_users, free_users,
+                         labels=['Paying Users', 'Free Users'],
+                         colors=['#06d6a0', '#95a5a6'], alpha=0.7)
+            ax8.plot(month_index, total_users, linewidth=2, color='#2c3e50', 
+                    linestyle='--', label='Total Users')
+            
+            ax8.set_title('Users Breakdown: Paying vs Free', fontweight='bold', fontsize=10)
+            ax8.set_xlabel('Month', fontsize=8)
+            ax8.set_ylabel('Users', fontsize=8)
+            ax8.grid(True, alpha=0.3)
+            ax8.legend(fontsize=7, loc='upper left')
+            ax8.tick_params(axis='both', labelsize=7)
+        else:
+            # Fallback if columns don't exist yet
+            ax8.text(0.5, 0.5, 'Recalculate to see\nUsers Breakdown', 
+                    ha='center', va='center', transform=ax8.transAxes, fontsize=10)
+            ax8.set_title('Users Breakdown: Paying vs Free', fontweight='bold', fontsize=10)
+        
+        # ===== Chart 9: New Payers by Channel =====
+        # Show monthly new payers breakdown by acquisition channel
+        if 'Org_New_Payers' in monthly_df.columns:
+            org_new = monthly_df['Org_New_Payers'].values
+            ads_new = monthly_df['PaidAds_New_Payers'].values
+            inf_new = monthly_df['Inf_New_Payers'].values
+            other_new = monthly_df['Other_New_Payers'].values
+            
+            ax9.stackplot(month_index, org_new, ads_new, inf_new, other_new,
+                         labels=['Organic', 'Paid Ads', 'Influencer', 'Other'],
+                         colors=['#06d6a0', '#ef476f', '#ffd166', '#118ab2'], alpha=0.7)
+            
+            # Line for total new payers
+            total_new = org_new + ads_new + inf_new + other_new
+            ax9.plot(month_index, total_new, linewidth=2, color='#2c3e50', 
+                    linestyle='--', label='Total New Payers')
+            
+            ax9.set_title('New Payers by Channel', fontweight='bold', fontsize=10)
+            ax9.set_xlabel('Month', fontsize=8)
+            ax9.set_ylabel('New Payers', fontsize=8)
+            ax9.grid(True, alpha=0.3)
+            ax9.legend(fontsize=7, loc='upper left')
+            ax9.tick_params(axis='both', labelsize=7)
+        else:
+            # Fallback if columns don't exist yet
+            ax9.text(0.5, 0.5, 'Recalculate to see\nNew Payers by Channel', 
+                    ha='center', va='center', transform=ax9.transAxes, fontsize=10)
+            ax9.set_title('New Payers by Channel', fontweight='bold', fontsize=10)
+        
+        # ===== Chart 10: CAC e LTV nel tempo =====
+        # Mostra l'andamento del CAC cumulativo e LTV con dual axis
+        if 'Cumulative_CAC' in monthly_df.columns:
+            cac_values = monthly_df['Cumulative_CAC'].values
+            ltv_values = monthly_df['Monthly_LTV'].values
+            ratio_values = monthly_df['LTV_CAC_Ratio'].values
+            
+            # Asse principale per CAC e LTV (in EUR)
+            line1, = ax10.plot(month_index, cac_values, linewidth=2, color='#ef476f', label='CAC (cumulative)')
+            line2, = ax10.plot(month_index, ltv_values, linewidth=2, color='#06d6a0', label='LTV')
+            
+            ax10.set_title('CAC vs LTV over Time', fontweight='bold', fontsize=10)
+            ax10.set_xlabel('Month', fontsize=8)
+            ax10.set_ylabel('EUR', fontsize=8, color='#2c3e50')
+            ax10.grid(True, alpha=0.3)
+            ax10.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'€{x:,.0f}'))
+            ax10.tick_params(axis='both', labelsize=7)
+            
+            # Asse secondario per LTV/CAC ratio
+            ax10_twin = ax10.twinx()
+            line3, = ax10_twin.plot(month_index, ratio_values, linewidth=2, color='#118ab2', 
+                                    linestyle='--', label='LTV/CAC Ratio')
+            ax10_twin.set_ylabel('LTV/CAC Ratio', fontsize=8, color='#118ab2')
+            ax10_twin.tick_params(axis='y', labelsize=7, labelcolor='#118ab2')
+            
+            # Linea orizzontale a ratio=3 (benchmark sano)
+            ax10_twin.axhline(y=3, color='#ffd166', linestyle=':', linewidth=1.5, alpha=0.7)
+            
+            # Legenda combinata
+            lines = [line1, line2, line3]
+            labels = [l.get_label() for l in lines]
+            ax10.legend(lines, labels, fontsize=7, loc='upper left')
+        else:
+            # Fallback if columns don't exist yet
+            ax10.text(0.5, 0.5, 'Recalculate to see\nCAC vs LTV', 
+                    ha='center', va='center', transform=ax10.transAxes, fontsize=10)
+            ax10.set_title('CAC vs LTV over Time', fontweight='bold', fontsize=10)
         
         self.figure.tight_layout(pad=2.0)
         self.canvas.draw()

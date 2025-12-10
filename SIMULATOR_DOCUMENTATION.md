@@ -123,7 +123,7 @@ Esempio: 0.13 × 0.035 = 0.00455 (0.455%)
 ### 3.7 Referral
 | Parametro | Unità | Default | Descrizione |
 |-----------|-------|---------|-------------|
-| `Referral_Monthly_Rate` | ratio | 0.02 | % utenti che referiscono (2%/mese) |
+| `Referral_Monthly_Rate` | ratio | 0.02 | Probabilità lifetime che un nuovo utente registrato inviti un amico (2%). Applicata una sola volta alla coorte di nuovi Signups del mese. |
 | `Referral_Reward_per_Sub` | EUR | 10 | Reward per referral |
 
 ### 3.8 Paid Social Ads
@@ -276,8 +276,22 @@ Org_New_Payers = Org_Signups × ConvSP
 Inf_New_Payers = Inf_Signups × ConvSP
 Other_New_Payers = Other_Signups × ConvSP
 
-# Referral (da base utenti esistente)
-Referral_New_Payers = Paying_Users_Start × Referral_Monthly_Rate
+# Referral (NUOVA LOGICA v7.3)
+# Ogni nuovo utente registrato ha probabilità Referral_Monthly_Rate di invitare un amico
+# La saturazione di mercato frena i referral quando ci si avvicina al tetto
+
+# Base: nuovi registrati del mese (non più l'intera base utenti)
+Referral_Eligible_Users = Signups
+
+# Potenziali inviter = nuovi registrati × probabilità di invitare (2%)
+Potential_Referral_Inviters = Referral_Eligible_Users × Referral_Monthly_Rate
+
+# Fattore di saturazione: quando il mercato è quasi pieno, i referral si spengono
+# referral_capacity ∈ [0, 1]: 1 = mercato vuoto, 0 = mercato pieno
+referral_capacity = max(0.0, 1.0 - Paying_Users_Start / Market_Max_PayingUsers)
+
+# Nuovi paying da referral
+Referral_New_Payers = Potential_Referral_Inviters × referral_capacity
 
 # Totale new payers
 New_Paying_Users = Org_New_Payers + Inf_New_Payers + Other_New_Payers + Referral_New_Payers
@@ -305,9 +319,14 @@ Paying_Users_End = min(Paying_Users_End, Market_Max_PayingUsers)  # Cap
 - **Output**: `Inf_Visitors`, `Inf_Signups`, `Inf_New_Payers`
 - **Costo**: `Inf_Marketing_Spend = Inf_New_Payers × Influencer_Reward_per_Sub`
 
-### 6.3 Referral Program
-- **Input**: `Referral_Monthly_Rate`, `Referral_Reward_per_Sub`
-- **Output**: `Referral_New_Payers`
+### 6.3 Referral Program (NUOVA LOGICA v7.3)
+- **Input**: `Referral_Monthly_Rate`, `Referral_Reward_per_Sub`, `Market_Max_PayingUsers`
+- **Base calcolo**: `Signups` (nuovi registrati del mese, NON l'intera base utenti)
+- **Logica**: 
+  - Ogni nuovo registrato ha probabilità `Referral_Monthly_Rate` (2%) di invitare un amico
+  - Probabilità applicata **una sola volta** per utente (alla coorte del mese di registrazione)
+  - Saturazione: `referral_capacity = max(0, 1 - Paying_Users / Market_Max_PayingUsers)`
+- **Output**: `Referral_New_Payers = Signups × Referral_Monthly_Rate × referral_capacity`
 - **Costo**: `Referral_Marketing_Spend = Referral_New_Payers × Referral_Reward_per_Sub`
 
 ### 6.4 Other Channels (SEO, PR, Communities)
